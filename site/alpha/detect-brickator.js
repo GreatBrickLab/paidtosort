@@ -1,5 +1,5 @@
 // Part finder (the only detector): YOLO11n-seg "lego_brick" model run in the browser with onnxruntime-web (wasm), loaded on the first photo.
-// NOTE: see detector-test/brickator-license-deep-dive.md; the model license must be cleared before production use.
+// Weights are distributed under AGPL-3.0 with this project (see THIRD_PARTY_NOTICES.md); upstream author confirmation is pending.
 window.PTSBrickator = (() => {
   const VER = "brickator-y11n-1024", S = 1024, THR = 0.15, IOU = 0.5, FILL = 0.45, MODEL = "/alpha/models/brickator-y11n-seg-1024.onnx?v=1";
   let ready = null; const stats = { load_ms: null, infer_ms: null, post_ms: null, boxes: 0, raw: 0, paper: false };

@@ -331,12 +331,7 @@ export async function onRequest(ctx) {
     await hs.update("qrcodes", { code: b.code }, { status: "used" }); if (b.status === "labelled") await hs.update("bags", { id: b.id }, { status: "bagged" }); return J2({ ok: true });
   }
   if (path === "boxes") {
-    if (M === "POST") {
-      let n = (await hs.count("boxes")).n + 1, bc;
-      do { bc = `BX${String(host.id).padStart(2, "0")}${String(n++).padStart(5, "0")}`; } while (await hs.get("boxes", { barcode: bc }));
-      const id = await hs.nextId("box"); await hs.put("boxes", { id, barcode: bc, shelf: String(body.shelf || "").trim().toUpperCase().slice(0, 24), created: now() });
-      return J2({ id });
-    }
+    if (M === "POST") return E2("boxes are created in Batch prep (host/batch)", 404);
     const bx = await hs.list("boxes", {}, "id desc");
     const per = new Map((await hs.group("bags", "box_id", { box_id: bx.map(x => x.id), status: { ne: "void" } }, "qty")).map(r => [r.k, r]));
     return J2({ boxes: bx.map(x => ({ ...x, nb: per.get(x.id)?.n || 0, pcs: per.get(x.id)?.s || 0 })) });
@@ -346,8 +341,7 @@ export async function onRequest(ctx) {
     let msg = null;
     if (M === "POST") {
       if (body.action === "shelf") { box.shelf = String(body.shelf || "").trim().toUpperCase().slice(0, 24); await hs.put("boxes", box); await hs.update("bags", { box_id: box.id }, { location: box.shelf }); msg = "Shelf address saved."; }
-      if (body.action === "add") { let n = 0; for (const code of (body.codes || []).slice(0, 500)) { const b = await R.bag(code); if (b && b.status !== "void") {
-          await hs.update("bags", { id: b.id }, { box_id: box.id, location: box.shelf, status: b.status === "labelled" ? "bagged" : b.status }); await hs.update("qrcodes", { code: b.code }, { status: "used" }); n++; } } msg = `Added ${n} bag(s).`; }
+      if (body.action === "add") return E2("bags are added to boxes in Batch prep", 400);
       if (body.action === "remove") { const b = await R.bag(body.code); if (b && b.box_id === box.id) await hs.update("bags", { id: b.id }, { box_id: null }); }
     }
     return J2({ box, msg, bags: await R.bagsOut(await hs.list("bags", { box_id: box.id, status: { ne: "void" } }, "id")),

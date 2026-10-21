@@ -419,20 +419,15 @@ function reviewPhoto(cvs, parts, pt, sid, missed0) { return new Promise(resolve 
 function shrink(dataURL, max) { return new Promise(res => { const im = new Image(); im.onload = () => { const s = Math.min(1, max / Math.max(im.width, im.height)), c = document.createElement("canvas"); c.width = im.width * s; c.height = im.height * s; c.getContext("2d").drawImage(im, 0, 0, c.width, c.height); res(c.toDataURL("image/jpeg", 0.8)); }; im.src = dataURL; }); }
 
 V.boxes = async () => { const j = await api("boxes");
-  main.innerHTML = `<h1>Boxes</h1><form class="card" id="nb"><h3>New box</h3><label>Shelf address<input name="shelf" placeholder="e.g. A-01-2" autocapitalize="characters"></label><button class="btn gold wide">Create box + batch barcode</button></form>
-  ${j.boxes.map(x => `<a class="row card" href="#/box/${x.id}"><span style="max-width:130px">${barSVG(x.barcode).replace("<svg", '<svg class="bc"')}</span><span><b class="mono">${x.barcode}</b><br><span class="muted small">${x.nb} bags · ${x.pcs} pcs</span></span>${pill(x.shelf || "no shelf", "")}</a>`).join("") || `<p class="muted">No boxes yet.</p>`}`;
-  $("#nb").onsubmit = async e => { e.preventDefault(); const r = await api("boxes", { shelf: e.target.shelf.value }); location.hash = "#/box/" + r.id; }; };
+  main.innerHTML = `<h1>Boxes</h1><div class="card">${ME?.user.role === "admin" ? `<p class="muted small">New boxes and their bag QR sheets are made in Batch prep.</p><a class="btn gold wide" href="#/host/batch">Open Batch prep</a>` : `<p class="muted small">New boxes and bag QR sheets are made by a host admin in Batch prep.</p>`}<a class="btn wide" href="#/putaway" style="margin-top:8px">Put-away</a></div>
+  ${j.boxes.map(x => `<a class="row card" href="#/box/${x.id}"><span style="max-width:130px">${barSVG(x.barcode).replace("<svg", '<svg class="bc"')}</span><span><b class="mono">${x.barcode}</b><br><span class="muted small">${x.nb} bags · ${x.pcs} pcs</span></span>${pill(x.shelf || "no shelf", "")}</a>`).join("") || `<p class="muted">No boxes yet.</p>`}`; };
 
 V.box = async (id, j) => { await palette(); j = j || await api("box/" + id); const b = j.box;
   main.innerHTML = `<h1 class="mono">Box ${b.barcode}</h1>${j.msg ? `<p class="okmsg">${esc(j.msg)}</p>` : ""}
   <div class="card center">${barSVG(b.barcode).replace("<svg", '<svg class="bcbig"')}</div>
   <form class="card" id="sf"><label>Shelf address<input name="shelf" value="${esc(b.shelf || "")}" autocapitalize="characters"></label><button class="btn wide">Save shelf</button></form>
-  <form class="card" id="af"><h3>Add bags</h3><label>Scan or type bag QR codes<input name="codes" id="scanin" placeholder="PTS-…" autocapitalize="characters"></label>
-  ${j.loose.length ? `<p class="muted small">Or tick loose bags:</p>` + j.loose.map(x => `<label class="tick"><input type="checkbox" name="bag" value="${x.code}"><img src="${img(x.part, x.color)}" alt=""><span>${contents(x)} <span class="mono small muted">${x.code}</span></span></label>`).join("") : ""}
-  <button class="btn gold wide">Add to box</button></form>
   <h2>In this box <span class="muted small">${j.bags.length}</span></h2>${j.bags.map(x => `<div class="bag card"><img src="${img(x.part, x.color)}" class="thumb" alt=""><div class="grow"><a href="#/bag/${x.code}">${contents(x)}</a><br><span class="mono small muted">${x.code} · ${x.status}</span></div><button class="btn ghost small rm" data-c="${x.code}">✕</button></div>`).join("")}`;
   $("#sf").onsubmit = async e => { e.preventDefault(); V.box(id, await api("box/" + id, { action: "shelf", shelf: e.target.shelf.value })); };
-  $("#af").onsubmit = async e => { e.preventDefault(); const codes = e.target.codes.value.split(/[\s,]+/).filter(Boolean).concat($$("#af input[name=bag]:checked").map(x => x.value)); V.box(id, await api("box/" + id, { action: "add", codes })); };
   $$(".rm").forEach(x => x.onclick = async () => V.box(id, await api("box/" + id, { action: "remove", code: x.dataset.c }))); };
 
 V.host = async () => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } await palette();
