@@ -73,6 +73,7 @@ V.session = async (sid) => { await palette(); const j = await api("session/" + s
    <p class="small trainnote">ⓘ Part photos help improve detection.</p><button type="button" class="btn wide" id="missbtn" hidden>＋ Missed a part?</button>
    <div id="prog" class="prog" hidden><div class="spin"></div><span id="progt">Working…</span></div><canvas id="prev" class="prev" hidden></canvas><div id="review" class="review" hidden></div></div>` : ""}
   <div id="openbar">${open ? openBarHTML() : ""}</div>
+  <div id="dock" class="dock"><div id="photo" hidden></div></div>
   <h2>Verify <span class="muted small" id="pend">${j.cards.length} to check</span></h2>
   <p class="muted small">Swipe up on a card’s <b>⇡ bar</b> to confirm it (or tap ✓); scroll anywhere else. Confirmed lots go into the bag you picked above (scan the box’s master QR, then a bag QR).</p>
   <div id="cards">${j.cards.map(c => cardHTML(c)).join("")}</div>
@@ -85,7 +86,7 @@ ${CS_HTML}`;
   if (open) { ["#cam", "#pick"].forEach(id => $(id).onchange = e => processPhoto(sid, e.target.files[0]));
    
     $("#endf").onsubmit = async e => { e.preventDefault(); await api(`session/${sid}/end`, { weight_lb: e.target.w?.value || null }); await trainCheck(sid, true); route(); }; }
-  wireCards(j.cards); wireBags($("#bags")); wireOpenBar();
+  wireCards(j.cards); wireBags($("#bags")); wireOpenBar(); PH.init(j.cards);
   if (open) { localStorage.setItem(LASTK(), sid); resumeReview(sid); } else if (localStorage.getItem(LASTK()) === sid) localStorage.removeItem(LASTK());
   trainHooks(sid, open);
 };
@@ -128,14 +129,18 @@ const quickIds = c => { const g = (c.color_guesses || []).filter(x => x !== c.co
 // top alternates from identification: one tap switches the card's part (color and qty kept)
 const altHTML = c => { const as = (c.alts || []).filter(a => a.id !== c.part).slice(0, 3);
   return (as.length ? `<div class="small muted">Other matches</div><div class="chips">${as.map(a => `<button type="button" class="chip alt" data-p="${esc(a.id)}" data-n="${esc(a.name || "")}"><img src="${img(a.id, c.color)}" alt="" onerror="this.style.visibility='hidden'"><span><b class="mono">${esc(a.id)}</b> ${esc((a.name || "").slice(0, 28))} <small class="muted">${Math.round((a.score || 0) * 100)}%</small></span></button>`).join("")}</div>` : ""); };
+// match score: one bar + words; green-teal sure, gold check, red double-check (same 0.7 line as before)
+const scoreCls = v => v >= 0.8 ? "hi" : v >= 0.7 ? "mid" : "lo";
+const scoreHTML = v => { const p = Math.round((+v || 0) * 100), k = scoreCls(v);
+  return `<div class="score ${k}" title="identification match"><span class="sbar"><i style="width:${p}%"></i></span>${k === "lo" ? `<span class="warn small flagl">⚠ Low match ${p}%: double-check</span>` : `<span class="small">${k === "hi" ? "Sure" : "Likely"} · match ${p}%</span>`}</div>`; };
 const cardHTML = (c, lot) => `<div class="pcard${lot ? " lotedit" : ""}" data-id="${c.id}"${lot ? ` data-lot="${c.id}"` : ""} data-part="${esc(c.part)}" data-color="${c.color}" data-qty="${c.qty}">
  <button type="button" class="colorbtn"><i style="background:#${crgb(c.color)}"></i><span class="cn">${esc(cname(c.color))}</span><small>change ▾</small></button>
  <div class="quick">${quickIds(c).map(id => chip(id, id === c.color)).join("")}</div>
- <div class="pimg"><img src="${img(c.part, c.color)}" onerror="this.onerror=null;this.src='${c.crop || ""}'" alt=""></div>
+ <div class="pimg"><img src="${img(c.part, c.color)}" onerror="this.onerror=null;this.src='${c.crop || ""}'" alt="">${lot ? "" : `<button type="button" class="pno ${scoreCls(c.confidence)}" hidden aria-label="show this part on the photo"></button>`}</div>
  <div class="pinfo"><div class="pn mono">${esc(c.part)}</div><div class="nm">${esc(c.name)}</div>
- <div class="qty"><button type="button" class="qbtn minus" aria-label="less">−</button><b>${c.qty}</b><button type="button" class="qbtn plus" aria-label="more">+</button></div>${c.confidence < 0.7 ? `<div class="warn small flagl">⚠ Low match ${Math.round(c.confidence * 100)}%: double-check</div>` : `<div class="small muted">match ${Math.round(c.confidence * 100)}%</div>`}</div>
+ <div class="qty"><button type="button" class="qbtn minus" aria-label="less">−</button><b>${c.qty}</b><button type="button" class="qbtn plus" aria-label="more">+</button></div>${scoreHTML(c.confidence)}</div>
  <div class="altbox">${altHTML(c)}</div>
- ${c.crop ? `<div class="pcrop"><img src="${c.crop}" alt="photo of this part" draggable="false"><span>your photo</span></div>` : ""}
+ ${c.crop ? `<div class="pcmp"><div class="ptile"><img class="mimg" src="${img(c.part, c.color)}" alt="matched part" draggable="false" onerror="this.style.visibility='hidden'"><span>our match</span></div><div class="pcrop"><img src="${c.crop}" alt="photo of this part" draggable="false"><span>your photo</span></div></div>` : ""}
  <div class="mold" hidden></div>
  ${lot ? `<div class="pact"><button type="button" class="btn gold done">Done</button></div>` : `<div class="pact"><button class="btn gold ok">✓</button><button class="btn ghost drop">Drop</button></div><div class="grip" aria-label="swipe up here to confirm">⇡ swipe up here to confirm</div>`}</div>`;
 const lotHTML = l => `<div class="lot" data-lot="${l.id}"><div class="lacts"><button type="button" class="lact ledit">Edit</button><button type="button" class="lact ldel">Delete</button></div>
@@ -211,18 +216,18 @@ const ep = el => (el.dataset.lot ? "lot/" : "card/") + el.dataset.id;
 function wireCards(cards, els) { els = els || $$(".pcard:not(.lotedit)");
   const byId = Object.fromEntries(cards.map(c => [c.id, c]));
   const left = () => { const n = $$(".pcard:not(.lotedit):not(.going):not(.dropping)").length; $("#pend").textContent = n + " to check"; if ($("#ca_n")) { $("#ca_n").textContent = n; $("#confirmall").hidden = !n; } };
-  const confirmCard = async (el, extra) => { if (el.classList.contains("going")) return; el.classList.add("going"); const j = await api("card/" + el.dataset.id, Object.assign({ action: "confirm", qty: +el.dataset.qty || 1 }, extra || {}));
-    if (j.ok) { const ex = document.querySelector(`.bagc[data-code="${j.code}"]`); if (ex) replaceBag(j.bag); else { $$("#bags details.bagc").forEach(d => { if (bagOpenPref(d.dataset.code) !== true) d.open = false; }); $("#bags").insertAdjacentHTML("beforeend", bagHTML(j.bag, { n: $$("#bags .bagc").length + 1, open: true })); wireBags($("#bags"), $("#bags .bagc:last-child")); updateOpenBar(j.bag); }
+  let bulk = false; const confirmCard = async (el, extra) => { if (el.classList.contains("going")) return; el.classList.add("going"); const j = await api("card/" + el.dataset.id, Object.assign({ action: "confirm", qty: +el.dataset.qty || 1 }, extra || {}));
+    if (j.ok) { PH.done(+el.dataset.id, !bulk); const ex = document.querySelector(`.bagc[data-code="${j.code}"]`); if (ex) replaceBag(j.bag); else { $$("#bags details.bagc").forEach(d => { if (bagOpenPref(d.dataset.code) !== true) d.open = false; }); $("#bags").insertAdjacentHTML("beforeend", bagHTML(j.bag, { n: $$("#bags .bagc").length + 1, open: true })); wireBags($("#bags"), $("#bags .bagc:last-child")); updateOpenBar(j.bag); }
       $("#bagbtns").hidden = false; $("#swipehint").hidden = false; setTimeout(() => el.remove(), 260); left(); if (TRAIN_SID) trainSoon(TRAIN_SID); } else { el.classList.remove("going"); toast(j.error || "failed"); } };
   // "Confirm all": every remaining card, with its current color / qty / part, goes into the open bag (in list order)
   const ca = $("#confirmall"); if (ca && !els.some(e => e.classList.contains("lotedit"))) ca.onclick = async () => { ca.disabled = true;
     await new Promise(r => setTimeout(r, 450)); await Q;   // let pending qty saves land first
-    const todo = $$(".pcard:not(.lotedit):not(.going):not(.dropping)"); for (const el of todo) await confirmCard(el);
+    const todo = $$(".pcard:not(.lotedit):not(.going):not(.dropping)"); bulk = true; for (const el of todo) await confirmCard(el); bulk = false;
     ca.disabled = false; left(); toast(`Confirmed ${todo.length} card${todo.length === 1 ? "" : "s"} into the selected bag`); };
   els.forEach(el => {
     const isLot = el.classList.contains("lotedit");
     if (!isLot) el.querySelector(".ok").onclick = () => confirmCard(el);
-    if (!isLot) el.querySelector(".drop").onclick = async () => { if (!confirm("Drop this lot?")) return; el.classList.add("dropping"); await api("card/" + el.dataset.id, { action: "drop" }); setTimeout(() => el.remove(), 260); left(); if (TRAIN_SID) trainSoon(TRAIN_SID); };
+    if (!isLot) el.querySelector(".drop").onclick = async () => { if (!confirm("Drop this lot?")) return; el.classList.add("dropping"); await api("card/" + el.dataset.id, { action: "drop" }); PH.done(+el.dataset.id, true); setTimeout(() => el.remove(), 260); left(); if (TRAIN_SID) trainSoon(TRAIN_SID); };
     // qty − / + : saved immediately (min 1); rapid taps are coalesced into one save
     let qt = null; const bump = d => { const q = Math.max(1, (+el.dataset.qty || 1) + d); el.dataset.qty = q; el.querySelector(".qty b").textContent = q;
       el.querySelector(".minus").disabled = q <= 1; clearTimeout(qt); qt = setTimeout(async () => { const j = await api(ep(el), { action: "edit", qty: q }); if (!j.ok) toast(j.error || "save failed"); }, 350); };
@@ -238,7 +243,7 @@ function wireCards(cards, els) { els = els || $$(".pcard:not(.lotedit)");
   const setColor = async (el, id) => { const j = await api(ep(el), { action: "edit", color: id }); if (!j.ok) return toast(j.error || "failed");
     el.dataset.color = j.color; const c = byId[el.dataset.id]; if (c) c.color = j.color;
     el.querySelector(".colorbtn i").style.background = "#" + crgb(j.color); el.querySelector(".colorbtn .cn").textContent = j.color_name;
-    el.querySelector(".pimg img").src = img(j.part, j.color);
+    el.querySelectorAll(".pimg img, .mimg").forEach(i => { i.style.visibility = ""; i.src = img(j.part, j.color); });
     el.querySelector(".quick").innerHTML = quickIds({ ...(c || {}), color: j.color }).map(x => chip(x, x === j.color)).join(""); wireQuick(el); };
   const wireQuick = el => el.querySelectorAll(".quick .chip").forEach(b => b.onclick = () => setColor(el, +b.dataset.c));
   let csEl = null, csKnown = [];
@@ -272,7 +277,7 @@ function wireCards(cards, els) { els = els || $$(".pcard:not(.lotedit)");
   // ---- alternates / part number: same edit as the mold switch, then the mold double-check re-runs for the new part
   const setPart = async (el, part, name) => { if (!name) name = (await partInfo(part)).name || ""; const j = await api(ep(el), { action: "edit", part, name }); if (!j.ok) return toast(j.error || "failed");
     el.dataset.part = j.part; const c = byId[el.dataset.id]; if (c) { c.part = j.part; c.name = j.name; }
-    el.querySelector(".pn").textContent = j.part; el.querySelector(".nm").textContent = j.name; el.querySelector(".pimg img").src = img(j.part, j.color);
+    el.querySelector(".pn").textContent = j.part; el.querySelector(".nm").textContent = j.name; el.querySelectorAll(".pimg img, .mimg").forEach(i => { i.style.visibility = ""; i.src = img(j.part, j.color); });
     el.querySelector(".altbox").innerHTML = altHTML({ ...(c || {}), part: j.part, color: j.color }); wireAlts(el); renderMold(el); toast(`Set to ${j.part} (color and qty kept)`); };
   const wireAlts = el => el.querySelectorAll(".chip.alt").forEach(b => b.onclick = () => setPart(el, b.dataset.p, b.dataset.n));
   els.forEach(wireAlts);
@@ -286,7 +291,7 @@ function wireCards(cards, els) { els = els || $$(".pcard:not(.lotedit)");
     box.hidden = false;
     box.querySelectorAll(".mv").forEach(b => b.onclick = async () => { const j = await api(ep(el), { action: "edit", part: b.dataset.p, name: b.dataset.n });
       if (!j.ok) return toast(j.error || "failed"); el.dataset.part = j.part; const c = byId[el.dataset.id]; if (c) { c.part = j.part; c.name = j.name; }
-      el.querySelector(".pn").textContent = j.part; el.querySelector(".nm").textContent = j.name; el.querySelector(".pimg img").src = img(j.part, j.color);
+      el.querySelector(".pn").textContent = j.part; el.querySelector(".nm").textContent = j.name; el.querySelectorAll(".pimg img, .mimg").forEach(i => { i.style.visibility = ""; i.src = img(j.part, j.color); });
       toast(`Switched to ${j.part} (color and qty kept)`); renderMold(el); }); }
 }
 
@@ -296,9 +301,10 @@ const ZM = (() => { let dbp = null; const idb = () => dbp || (dbp = new Promise(
   const tx = async (st, mode, fn) => { const d = await idb(); return new Promise((res, rej) => { const t = d.transaction(st, mode), q = fn(t.objectStore(st)); t.oncomplete = () => res(q && q.result); t.onerror = () => rej(t.error); }); };
   const prune = async () => { const old = Date.now() - 14 * 864e5; const ps = await tx("photos", "readonly", s => s.getAll()); for (const p of ps) if (p.t < old) await tx("photos", "readwrite", s => s.delete(p.id)); };
   setTimeout(() => prune().catch(() => {}), 4000);
-  return { addPhoto: async (blob, w, h) => { const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8); await tx("photos", "readwrite", s => s.put({ id, t: Date.now(), blob, w, h })); return id; },
-    mapCard: async (card, pid, box, scale) => { const ex = await tx("cards", "readonly", s => s.get(card)); if (!ex) await tx("cards", "readwrite", s => s.put({ card, pid, box, scale })); },
-    get: async card => { const m = await tx("cards", "readonly", s => s.get(card)); if (!m) return null; const p = await tx("photos", "readonly", s => s.get(m.pid)); return p ? { ...m, photo: p } : null; } }; })();
+  // photos are stored as bytes (ArrayBuffer), not Blob: some WebKit builds refuse Blobs in IndexedDB; older Blob records still read
+  return { addPhoto: async (blob, w, h) => { const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8), buf = await blob.arrayBuffer(); await tx("photos", "readwrite", s => s.put({ id, t: Date.now(), buf, type: blob.type || "image/jpeg", w, h })); return id; },
+    mapCard: async (card, pid, box, scale, boxes) => { const ex = await tx("cards", "readonly", s => s.get(card)); if (!ex) await tx("cards", "readwrite", s => s.put({ card, pid, box, scale, boxes: boxes || [box] })); },
+    get: async card => { const m = await tx("cards", "readonly", s => s.get(card)); if (!m) return null; const p = await tx("photos", "readonly", s => s.get(m.pid)); if (p && !p.blob && p.buf) p.blob = new Blob([p.buf], { type: p.type }); return p ? { ...m, photo: p } : null; } }; })();
 async function openZoom(cardId, cropSrc) { $("#zoom")?.remove();
   document.body.insertAdjacentHTML("beforeend", `<div id="zoom" class="zoom" role="dialog" aria-label="Photo of this part"><canvas id="zcv"></canvas><button type="button" class="zx" id="zx" aria-label="Close">✕</button><p class="zhint" id="zhint">Drag to move · pinch to zoom · tap outside the photo or ✕ to close</p></div>`);
   const z = $("#zoom"), cv = $("#zcv"), g = cv.getContext("2d"), close = () => { z.remove(); document.body.style.overflow = ""; }; document.body.style.overflow = "hidden";
@@ -323,6 +329,48 @@ async function openZoom(cardId, cropSrc) { $("#zoom")?.remove();
   cv.onpointerup = cv.onpointercancel = e => { pts.delete(e.pointerId); if (pts.size < 2) last = null; if (!moved && pts.size === 0 && !inImg(e.clientX, e.clientY)) close(); };
   cv.onwheel = e => { e.preventDefault(); const f = Math.exp(-e.deltaY / 300); tx0 = e.clientX - (e.clientX - tx0) * f; ty0 = e.clientY - (e.clientY - ty0) * f; s *= f; draw(); };
   draw(); }
+// ---- photo panel (sticky, above the cards): the last photo with the finder's boxes, each numbered and linked to its card.
+// Tap a box -> its card is selected and scrolled to; tap a card (or its number) -> its box lights up. Confirmed / dropped boxes turn teal ✓.
+let PH_RZ = 0;
+const PH = (() => { let im = null, items = [], sel = null, view = null, small = sessionStorage.getItem("pts_ph_small") === "1";
+  const el = () => $("#photo");
+  async function init(cards) { document.body.classList.remove("has-photo"); const host = el(); if (!host) return; im = null; items = []; sel = null; host.hidden = true;
+    const ms = []; for (const c of cards) { const m = await ZM.get(c.id).catch(() => null); if (m) ms.push({ c, m }); } if (!ms.length) return;
+    const pid = ms.reduce((a, x) => x.m.photo.t > a.photo.t ? x.m : a, ms[0].m).pid, mine = ms.filter(x => x.m.pid === pid);   // newest photo
+    const p = mine[0].m.photo; im = await createImageBitmap(p.blob);
+    items = mine.map((x, i) => ({ id: x.c.id, n: i + 1, k: scoreCls(x.c.confidence), boxes: (x.m.boxes || [x.m.box]).map(b => b.map(v => v * (x.m.scale || 1))), done: false }));
+    items.forEach(it => { const b = document.querySelector(`.pcard[data-id="${it.id}"] .pno`); if (b) { b.textContent = it.n; b.hidden = false; } });
+    host.className = "card photop"; host.innerHTML = `<div class="phead small"><span><b>Your photo</b> · tap a box to find its card</span><button type="button" class="btn small ghost" id="ph_sz">${small ? "Bigger" : "Smaller"}</button></div><canvas id="pcv"></canvas>`;
+    host.hidden = false; document.body.classList.add("has-photo"); $("#ph_sz").onclick = () => { small = !small; sessionStorage.setItem("pts_ph_small", small ? "1" : "0"); $("#ph_sz").textContent = small ? "Bigger" : "Smaller"; fit(); };
+    const cv = $("#pcv"); cv.onclick = e => { const q = cv.getBoundingClientRect(), x = (e.clientX - q.left - view.ox) / view.s + view.x0, y = (e.clientY - q.top - view.oy) / view.s + view.y0;
+      const hit = items.filter(it => !it.done && it.boxes.some(b => x >= b[0] - 8 && x <= b[2] + 8 && y >= b[1] - 8 && y <= b[3] + 8))
+        .sort((a, b) => area(a) - area(b))[0]; if (hit) pick(hit.id, true); else pick(null); };
+    $$(".pcard:not(.lotedit)").forEach(c => { c.addEventListener("click", e => { if (e.target.closest("button:not(.pno),input,.pcrop,.chip,a")) return; pick(+c.dataset.id, false, true); }); });
+    if (!PH_RZ) { PH_RZ = 1; addEventListener("resize", () => PH.fit()); } fit(); }
+  const area = it => it.boxes.reduce((a, b) => a + (b[2] - b[0]) * (b[3] - b[1]), 0);
+  function fit() { const host = el(), cv = $("#pcv"); if (!host || host.hidden || !cv || !im) return dockVar();
+    // show the area the parts are in (union of boxes + margin), not the whole table
+    const bs = items.flatMap(it => it.boxes); let [x0, y0, x1, y1] = [Math.min(...bs.map(b => b[0])), Math.min(...bs.map(b => b[1])), Math.max(...bs.map(b => b[2])), Math.max(...bs.map(b => b[3]))];
+    const mg = 0.06 * Math.max(x1 - x0, y1 - y0); x0 = Math.max(0, x0 - mg); y0 = Math.max(0, y0 - mg); x1 = Math.min(im.width, x1 + mg); y1 = Math.min(im.height, y1 + mg);
+    const W = host.clientWidth - 12, H = Math.round(innerHeight * (small ? 0.15 : 0.24)), s = Math.min(W / (x1 - x0), H / (y1 - y0)), dpr = devicePixelRatio || 1;
+    cv.style.width = W + "px"; cv.style.height = H + "px"; cv.width = W * dpr; cv.height = H * dpr;
+    view = { x0, y0, x1, y1, s, ox: (W - (x1 - x0) * s) / 2, oy: (H - (y1 - y0) * s) / 2, W, H, dpr }; draw(); dockVar(); }
+  function draw() { const cv = $("#pcv"); if (!cv || !view) return; const g = cv.getContext("2d"), { x0, y0, x1, y1, s, ox, oy, W, H, dpr } = view;
+    g.setTransform(dpr, 0, 0, dpr, 0, 0); g.fillStyle = "#14282a"; g.fillRect(0, 0, W, H); g.drawImage(im, x0, y0, x1 - x0, y1 - y0, ox, oy, (x1 - x0) * s, (y1 - y0) * s);
+    const R = b => [ox + (b[0] - x0) * s, oy + (b[1] - y0) * s, (b[2] - b[0]) * s, (b[3] - b[1]) * s];
+    if (sel !== null) { g.fillStyle = "#0006"; g.fillRect(0, 0, W, H); const it = items.find(x => x.id === sel); if (it) it.boxes.forEach(b => { const [x, y, w, h] = R(b); g.drawImage(im, b[0], b[1], b[2] - b[0], b[3] - b[1], x, y, w, h); }); }
+    for (const it of [...items].sort((a, b) => (a.id === sel) - (b.id === sel))) { const on = it.id === sel, col = it.done ? "#0E4A4F" : it.k === "lo" ? "#e0245e" : "#F2B233";
+      it.boxes.forEach((b, j) => { const [x, y, w, h] = R(b); g.lineWidth = on ? 4 : 2; g.strokeStyle = on ? "#fff" : col; if (it.done) g.setLineDash([5, 4]); g.strokeRect(x, y, w, h); g.setLineDash([]);
+        if (on) { g.lineWidth = 2; g.strokeStyle = col; g.strokeRect(x - 3, y - 3, w + 6, h + 6); }
+        if (j) return; const t = it.done ? "✓" : String(it.n), r = on ? 12 : 10; g.beginPath(); g.arc(x + 2, y + 2, r, 0, 7); g.fillStyle = it.done ? "#0E4A4F" : col; g.fill();
+        g.fillStyle = it.done || it.k === "lo" ? "#fff" : "#0E4A4F"; g.font = `bold ${on ? 14 : 12}px system-ui,sans-serif`; g.textAlign = "center"; g.textBaseline = "middle"; g.fillText(t, x + 2, y + 3); }); } }
+  function dockVar() { const d = $("#dock"); document.documentElement.style.setProperty("--dockh", ((d ? d.offsetHeight : 0) + 56) + "px"); }
+  function pick(id, scroll, fromCard) { if (fromCard && id === sel) id = null; sel = id; $$(".pcard.sel").forEach(c => c.classList.remove("sel"));
+    const c = id !== null && document.querySelector(`.pcard[data-id="${id}"]`); if (c) { c.classList.add("sel"); if (scroll) c.scrollIntoView({ behavior: "smooth", block: "start" }); } draw(); }
+  function done(id, next) { const it = items.find(x => x.id === id); if (it) it.done = true; const was = sel === id || sel === null;
+    if (next && was) { const nx = $$(".pcard:not(.lotedit):not(.going):not(.dropping)").find(c => +c.dataset.id !== id); pick(nx ? +nx.dataset.id : null, !!nx && items.some(x => x.id === +nx.dataset.id)); } else draw();
+    if (!items.some(x => !x.done)) { const h = el(); if (h) h.hidden = true; dockVar(); } }
+  return { init, fit, done, pick }; })();
 async function processPhoto(sid, file) {
   if (!file) return; const prog = $("#prog"), pt = $("#progt"); prog.hidden = false;
   try {
@@ -387,7 +435,7 @@ async function finishPhoto(sid, cvs, parts, missed0, resumed, det) {
     const cid = line => line === null ? null : (sv.ids || [])[line] ?? null;
     // tap-to-zoom: keep the source photo + each card's detection box on the phone (works after reload / resume)
     try { const pid = await ZM.addPhoto(await new Promise(r => cvs.toBlob(r, "image/jpeg", 0.9)), cvs.width, cvs.height);
-      for (const b of [...tboxes, ...mboxes]) { const id = cid(b.line); if (id) await ZM.mapCard(id, pid, b.box, 1); } } catch (e) { console.warn("zoom store", e); }     // training sample: kept on the phone until these cards are resolved, then uploaded in the background; review boxes are labelled 'missed'
+      const per = {}; for (const b of [...tboxes, ...mboxes]) { const id = cid(b.line); if (id) (per[id] = per[id] || []).push(b.box); } for (const [id, bs] of Object.entries(per)) await ZM.mapCard(+id, pid, bs[0], 1, bs); } catch (e) { console.warn("zoom store", e); }     // training sample: kept on the phone until these cards are resolved, then uploaded in the background; review boxes are labelled 'missed'
     try { const tid = await PTSTrain.begin(sid, cvs, tboxes.map(b => ({ box: b.box.map(v => Math.round(v)), card_id: cid(b.line), pred: b.pred })), det);
       for (const b of mboxes) await PTSTrain.addMissed(tid, b.box.map(v => Math.round(v)), cid(b.line)); } catch (e) { console.warn("training sample", e); }
     toast(`${total} parts${missed.length ? ` (${missed.length} added by you)` : ""} → ${lines.length} lots${lowN ? ` · ${lowN} to double-check` : ""}${unk ? ` · ${unk} not recognised, retake the photo to try again` : ""}`, 3500); route();
