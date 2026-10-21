@@ -1,5 +1,6 @@
 // Paid to Sort ALPHA API (unlisted). Data in D1 (binding PTSDB) via the per-host gatekeeper in lib/store_d1.js;
 // Each request reads only the rows it needs (indexed by host + session / bag / card); KV (PTSA) holds training images and the pre-D1 backup.
+import { inventoryXml, lotsFromCards, validateImport, validPart, IMPORT_LIMITS } from "../../../lib/invfile.js";
 import { hostStore, sharedStore, findLogin, migrateFromKV, trainStore, ensureIndexes } from "../../../lib/store_d1.js";
 const HDR = { "content-type": "application/json", "x-robots-tag": "noindex, nofollow", "cache-control": "no-store" };
 const J = (o, s = 200, h = {}) => new Response(JSON.stringify(o), { status: s, headers: { ...HDR, ...h } });
@@ -8,7 +9,7 @@ const now = () => new Date().toISOString().replace("T", " ").slice(0, 19);
 const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, "0")).join("");
 const rnd = n => hex(crypto.getRandomValues(new Uint8Array(n)));
 const enc = new TextEncoder();
-const QR_TTL = 7 * 864e5;
+const QR_TTL = 7 * 864e5, PREP_TTL = 90 * 864e5;   // batch-prep sheets are printed ahead of time
 
 async function pbkdf2(pw, saltHex, it) {
   const k = await crypto.subtle.importKey("raw", enc.encode(pw), "PBKDF2", false, ["deriveBits"]);
@@ -171,7 +172,7 @@ export async function onRequest(ctx) {
   const sess = id => hs.get("sessions", { id: String(id) });
   let m;
   // these never touch bags/QR codes: skip the per-request housekeeping
-  const light = path === "identify" || path === "train/sample" || path === "train/cards" || /^crop\//.test(path) || path === "mold-exceptions";
+  const light = path === "identify" || path === "train/sample" || path === "train/cards" || /^crop\//.test(path) || path === "mold-exceptions" || path === "parts/info";
   if (!light) { await migrateBags(hs, sh); await R.expire(); }
 
   if (path === "me") {
@@ -214,7 +215,7 @@ export async function onRequest(ctx) {
     const inp = (body.cards || []).slice(0, 80), fresh = [], touched = new Set(); let added = 0; const ids = [];   // ids[i] = card that input line i landed in (training labels link boxes to cards)
     const nNew = inp.filter(c => c.part && c.part !== "?").length, newIds = nNew ? await hs.nextIds("card", nNew) : [];
     for (const c of inp) {
-      if (!c.part || c.part === "?") { ids.push(null); continue; }
+      if (!c.part || c.part === "?") { ids.push(null); continue; }   // unidentified crops are never saved as cards
       const ex = pend.find(x => x.part === c.part && x.color === +c.color);
       if (ex) { ex.qty += +c.qty || 1; touched.add(ex); ids.push(ex.id); continue; }
       const id = newIds.shift();
@@ -239,14 +240,15 @@ export async function onRequest(ctx) {
     if (!mine(s)) return E2("not found", 404);
     if (c.status !== "pending") return E2(`this lot is already ${c.status}`, 409);
     if (body.action === "drop") { c.status = "dropped"; await hs.put("cards", cardRow(c)); return J2({ ok: true }); }
-    if (body.part && body.part !== c.part) { c.part = String(body.part).trim().slice(0, 40); c.name = String(body.name || ""); }
+    if (body.part && body.part !== c.part) { const np = String(body.part).trim().slice(0, 40); if (!validPart(np)) return E2("bad part number"); c.part = np; c.name = String(body.name || ""); }
     if (body.color !== undefined && body.color !== "") c.color = +body.color;
     if (body.qty) c.qty = Math.max(1, +body.qty);
+    if (body.action === "confirm" && !validPart(c.part)) return E2("this card has no part number", 400);
     if (body.action === "confirm") {
       // the session's open bag collects confirmed lots until "Close bag"; no open bag -> start a new one (one QR per bag)
       const open = (await hs.list("qrcodes", { session_id: s.id, status: "open" })).map(q => q.code);
       let bag = open.length ? (await hs.list("bags", { code: open, session_id: s.id, status: "labelled" }, "id"))[0] : null;
-      if (!bag) bag = await R.newBag(s);
+      if (!bag) return E2("Scan the box QR and pick a bag first", 409);
       c.status = "confirmed"; c.bag_code = bag.code; await hs.put("cards", cardRow(c)); await R.syncBag(bag); await hs.staleTotals();
       if (c.image_id) await sh.confirmIdentification(c.image_id, c.part, c.color);
       return J2({ ok: true, code: bag.code, bag: await R.bagOut(bag), part: c.part, color: c.color, color_name: colorName(c.color), qty: c.qty, name: c.name });
@@ -275,16 +277,6 @@ export async function onRequest(ctx) {
     if (path === "host/train/delete" && M === "POST") { const n = Array.isArray(body.ids) ? await ts.deleteIds(host.id, body.ids) : await ts.deleteHost(host.id); return J2({ ok: true, deleted: n, ...(await ts.stats(host.id)) }); }
     return J2(await ts.stats(host.id));
   }
-  if (path === "labels") {
-    let bags = [];
-    if (url.searchParams.get("codes")) { const codes = url.searchParams.get("codes").split(",").map(c => c.trim().toUpperCase()).filter(Boolean).slice(0, 500);
-      const byCode = new Map((await hs.list("bags", { code: codes })).map(b => [b.code, b])); bags = codes.map(c => byCode.get(c)).filter(Boolean); }
-    else if (url.searchParams.get("session")) bags = await hs.list("bags", { session_id: url.searchParams.get("session"), status: { ne: "void" } }, "id");
-    const box = url.searchParams.get("box") ? await hs.get("boxes", { id: +url.searchParams.get("box") }) : null;
-    let out = await R.bagsOut(bags, true);
-    if (!url.searchParams.get("codes")) out = out.filter(b => b.lots.length);   // no labels for empty bags
-    return J2({ bags: out, box });
-  }
   if ((m = path.match(/^bag\/([\w-]+)$/)) && M === "GET") {
     const b = await R.bag(m[1]); if (!b || b.status === "void") return E2(`${m[1]}: unknown or expired bag QR`, 404);
     return J2({ bag: await R.bagOut(b) });
@@ -298,10 +290,25 @@ export async function onRequest(ctx) {
     await hs.update("qrcodes", { code: b.code }, { status: "open", expires: Date.now() + QR_TTL });
     return J2({ ok: true, bag: await R.bagOut(b), closed: await R.bagsOut(closed) });
   }
-  if ((m = path.match(/^session\/([\w-]+)\/newbag$/)) && M === "POST") {   // "Start new bag": close the open bag (if any) and open an empty one with its own QR
+  // sorter: scan the box master QR (links the box's prepared bags to this session) or a bag QR (that bag gets the photos / parts list)
+  if ((m = path.match(/^session\/([\w-]+)\/scan$/)) && M === "POST") {
     const s = await sess(m[1]); if (!mine(s) || s.status !== "open") return E2("session not open");
-    const closed = await R.closeOpen(s.id, null), bag = await R.newBag(s);
-    return J2({ ok: true, bag: await R.bagOut(bag), closed: await R.bagsOut(closed) });
+    const code = String(body.code || "").trim().toUpperCase(); let box = null, bag = null;
+    if (/^BX\d+$/.test(code)) box = await hs.get("boxes", { barcode: code });
+    else { bag = await R.bag(code); if (!bag || bag.status === "void") return E2(`${code}: not a known box or bag QR`, 404);
+      if (!bag.session_id) { if (bag.box_id === null || bag.box_id === undefined) return E2("this bag QR is not on a prepared box sheet"); box = await hs.get("boxes", { id: bag.box_id }); }
+      else if (bag.session_id !== s.id) return E2("this bag belongs to another sorting session", 409); }
+    if (!box && !bag) return E2(`${code}: not a known box QR`, 404);
+    if (box) { const bs = await hs.list("bags", { box_id: box.id, status: { ne: "void" } }, "id");
+      if (!bs.length) return E2("this box has no bag QRs; print its sheet from Batch prep");
+      if (bs.some(b => b.session_id && b.session_id !== s.id)) return E2("this box is already used by another sorting session", 409);
+      const free = bs.filter(b => !b.session_id).map(b => b.code);
+      for (let i = 0; i < free.length; i += 80) { const cs = free.slice(i, i + 80); await hs.update("bags", { code: cs }, { session_id: s.id, user_id: s.user_id }); await hs.update("qrcodes", { code: cs }, { session_id: s.id, user_id: s.user_id }); }
+      if (!bag) { const open = await hs.list("qrcodes", { session_id: s.id, status: "open" }); if (!open.some(q => bs.some(b => b.code === q.code))) bag = bs.find(b => b.status === "labelled") || null; } }
+    if (bag) { bag = await R.bag(bag.code); const q = await R.qr(bag.code);
+      if (bag.status !== "labelled" || !q || !["open", "issued"].includes(q.status)) return E2("this bag is already bagged, boxed or expired", 409);
+      await R.closeOpen(s.id, bag.code); await hs.update("qrcodes", { code: bag.code }, { status: "open" }); }
+    return J2({ ok: true, bag: bag ? await R.bagOut(bag) : null, bags: await R.bagsOut(await hs.list("bags", { session_id: s.id, status: { ne: "void" } }, "id")) });
   }
   if ((m = path.match(/^bag\/([\w-]+)\/close$/)) && M === "POST") {
     const b = await R.bag(m[1]); if (!b || !mine(await sess(b.session_id))) return E2("not found", 404);
@@ -313,7 +320,7 @@ export async function onRequest(ctx) {
     if (body.action === "remove") c.status = "removed";
     else if (body.action === "restore") c.status = "confirmed";
     else { if (c.status !== "confirmed") return E2("this part was removed from the bag", 409);
-      if (body.part && body.part !== c.part) { c.part = String(body.part).trim().slice(0, 40); c.name = String(body.name || ""); }
+      if (body.part && body.part !== c.part) { const np = String(body.part).trim().slice(0, 40); if (!validPart(np)) return E2("bad part number"); c.part = np; c.name = String(body.name || ""); }
       if (body.color !== undefined && body.color !== "") c.color = +body.color;
       if (body.qty) c.qty = Math.max(1, +body.qty); }
     await hs.put("cards", cardRow(c)); await R.syncBag(b); await hs.staleTotals();
@@ -346,19 +353,6 @@ export async function onRequest(ctx) {
     return J2({ box, msg, bags: await R.bagsOut(await hs.list("bags", { box_id: box.id, status: { ne: "void" } }, "id")),
       loose: await R.bagsOut(await hs.list("bags", { box_id: null, status: ["labelled", "bagged"] }, "id desc", 50)) });
   }
-  if (path === "repo") {
-    const q = (url.searchParams.get("q") || "").trim().toLowerCase(), col = url.searchParams.get("color") || "", st = url.searchParams.get("status") || "";
-    const bf = { status: st ? st : { ne: "void" } }; let rows;
-    if (q && /^pts-[0-9a-f]{8}$/.test(q)) rows = await hs.list("bags", { ...bf, code: q.toUpperCase() });
-    else if (q || col !== "") {   // search the lots, then load just their bags
-      const cf = { status: "confirmed", bag_code: { ne: null }, ...(col !== "" ? { color: +col } : {}) };
-      const hits = q ? [...await hs.list("cards", { ...cf, part: { prefix: q } }), ...await hs.list("cards", { ...cf, name: { contains: q } })] : await hs.list("cards", cf);
-      const codes = [...new Set(hits.map(c => c.bag_code))]; rows = codes.length ? await hs.list("bags", { ...bf, code: codes }) : [];
-    } else rows = await hs.list("bags", bf);
-    rows.sort((a, b) => (a.part + "|" + a.color).localeCompare(b.part + "|" + b.color) || a.id - b.id);
-    return J2({ rows: await R.bagsOut(rows.slice(0, 500)) });
-  }
-  // shared mold-variant exception list: everyone can read, host admins can add/remove
   if (path === "mold-exceptions") return J2({ parts: await sh.moldExceptions() });
   if (path === "host/mold-exceptions" && M === "POST") {
     if (!admin) return E2("host admins only", 403);
@@ -368,6 +362,41 @@ export async function onRequest(ctx) {
     else await sh.addMoldException(part, String(body.note || "").slice(0, 120), `${user.username} (${host.site_name})`);
     return J2({ ok: true, parts: await sh.moldExceptions() });
   }
+  // ---- inventory file (.bsx) export: one Item per part/color lot of the confirmed cards (void bags left out)
+  const invFile = async (cards, fname) => {
+    const voids = new Set((await hs.list("bags", { status: "void" })).map(b => b.code));
+    const xml = inventoryXml(lotsFromCards(cards.filter(c => !c.bag_code || !voids.has(c.bag_code))), { colorName: id => (PALETTE[id] || [""])[0] });
+    return new Response(xml, { headers: { "content-type": "application/xml; charset=utf-8", "content-disposition": `attachment; filename="${fname}"`, "cache-control": "no-store", "x-robots-tag": "noindex, nofollow" } }); };
+  if ((m = path.match(/^export\/session\/([\w-]+)$/)) && M === "GET") {
+    const s = await sess(m[1]); if (!mine(s)) return E2("not found", 404);
+    return invFile(await hs.list("cards", { session_id: s.id, status: "confirmed" }, "id"), `${s.id}.bsx`); }
+  if (path === "host/export" && M === "GET") {   // all of this host's sessions, or ?sessions=S-1,S-2
+    if (!admin) return E2("host admins only", 403);
+    const ids = (url.searchParams.get("sessions") || "").split(",").map(x => x.trim()).filter(x => /^[\w-]{1,40}$/.test(x)).slice(0, 200);
+    const cards = await hs.list("cards", ids.length ? { session_id: ids, status: "confirmed" } : { status: "confirmed" }, "id");
+    return invFile(cards, `${ids.length === 1 ? ids[0] : "host-" + host.id + "-" + now().slice(0, 10)}.bsx`); }
+  // ---- shared parts data (names + the colors each part comes in), used by the verify card's color list
+  if (path === "parts/info" && M === "GET") {
+    const ps = [...new Set((url.searchParams.get("p") || "").split(",").map(x => x.trim()).filter(validPart))].slice(0, 10);
+    const rows = ps.length ? (await D1.prepare(`select part, name, colors from parts where part in (${ps.map(() => "?").join(",")})`).bind(...ps).all()).results : [];
+    return J2({ parts: Object.fromEntries(rows.map(r => [r.part, { name: r.name || "", colors: JSON.parse(r.colors || "[]") }])) }, 200, { "cache-control": "private, max-age=300" }); }
+  if (path === "host/parts/import" && M === "POST") {   // host admins only; writes ONLY shared tables (parts, colors), never host data
+    if (!admin) return E2("host admins only", 403);
+    if (+(req.headers.get("content-length") || 0) > IMPORT_LIMITS.bodyBytes) return E2("request too large", 413);
+    const v = validateImport(body); if (v.error) return E2(v.error);
+    const ids = v.parts.map(p => p.part), have = new Map();
+    for (let i = 0; i < ids.length; i += 90) { const c = ids.slice(i, i + 90);
+      for (const r of (await D1.prepare(`select part, name, colors from parts where part in (${c.map(() => "?").join(",")})`).bind(...c).all()).results) have.set(r.part, r); }
+    const st = []; let added = 0, updated = 0, same = 0;
+    for (const p of v.parts) { const o = have.get(p.part);
+      const old = o ? JSON.parse(o.colors || "[]") : [], cols = [...old, ...p.colors.filter(c => !old.includes(c))], name = (o && o.name) || p.name;
+      if (o && cols.length === old.length && name === (o.name || "")) { same++; continue; }
+      o ? updated++ : added++;
+      st.push(D1.prepare("insert into parts(part, name, colors) values(?,?,?) on conflict(part) do update set name = excluded.name, colors = excluded.colors").bind(p.part, name, JSON.stringify(cols))); }
+    let colorsAdded = 0;
+    for (const [id, name] of v.colors) if (!PALETTE[id]) { st.push(D1.prepare("insert or ignore into colors(id, name) values(?,?)").bind(id, name)); PALETTE[id] = [name]; colorsAdded++; }
+    for (let i = 0; i < st.length; i += 50) await D1.batch(st.slice(i, i + 50));
+    return J2({ ok: true, added, updated, unchanged: same, colors_added: colorsAdded, errors: v.errors, n_errors: v.n_errors }); }
   if (path.startsWith("host")) {
     if (!admin) return E2("host admins only", 403);
     if (path === "host") { const us = await hs.list("users", {}, "id"), ns = new Map((await hs.group("sessions", "user_id")).map(r => [r.k, r.n]));
@@ -407,36 +436,28 @@ export async function onRequest(ctx) {
       await hs.put("users", { id: await hs.nextId("user"), username: un, pw_hash: await hashPw(body.password), role: "sorter", display: String(body.display || un).slice(0, 60), created: now() });
       return J2({ ok: true, msg: `Sorter ${un} added.` });
     }
-    if (path === "host/compare" && M === "POST") {   // whole-repository report (admin tool, on demand)
-      const inv = new Map(); for (const [p, c, q] of (body.items || []).slice(0, 100000)) { const k = p + "|" + (+c); inv.set(k, (inv.get(k) || 0) + (+q || 0)); }
-      const thr = host.low_threshold, res = [];
-      const bags = (await hs.list("bags", { status: { ne: "void" } }, "id")).filter(b => b.status !== "picked"), outs = await R.bagsOut(bags);
-      for (const bo of outs) for (const c of bo.lots) { const have = inv.get(c.part + "|" + c.color) || 0; if (have >= thr) continue;
-        res.push({ ...bo, lot_id: c.id, part: c.part, color: c.color, color_name: colorName(c.color), qty: c.qty, name: c.name, store_qty: have, tag: have ? "low" : "missing" }); }
-      res.sort((a, b) => (a.tag !== "missing") - (b.tag !== "missing") || (a.status === "promoted") - (b.status === "promoted") || a.part.localeCompare(b.part));
-      return J2({ res, thr, n_inv: inv.size });
+    // ---- batch prep (admin, before the sorter leaves): N boxes, each = 1 master QR (box barcode) + M bag QRs (bag 1..M), printed as one sheet
+    if (path === "host/batch" && M === "POST") {
+      const nb = Math.min(20, Math.max(1, +body.boxes || 1)), nq = Math.min(30, Math.max(1, +body.bags || 1)), shelf = String(body.shelf || "").trim().toUpperCase().slice(0, 24), made = [];
+      let n = (await hs.count("boxes")).n + 1;
+      for (let k = 0; k < nb; k++) { let bc; do { bc = `BX${String(host.id).padStart(2, "0")}${String(n++).padStart(5, "0")}`; } while (await hs.get("boxes", { barcode: bc }));
+        const id = await hs.nextId("box"); await hs.put("boxes", { id, barcode: bc, shelf, created: now() });
+        const ids = await hs.nextIds("bag", nq), st = [];
+        for (let q = 0; q < nq; q++) { let code; do { code = "PTS-" + rnd(4).toUpperCase(); } while (await R.qr(code));
+          st.push(hs.putStmt("qrcodes", { code, session_id: null, user_id: null, created: now(), expires: Date.now() + PREP_TTL, status: "issued" }),
+            hs.putStmt("bags", { id: ids[q], code, host_id: host.id, session_id: null, user_id: null, part: "", name: "", color: 0, qty: 0, box_id: id, location: shelf, status: "labelled", promoted_at: null, picked_at: null, created: now() })); }
+        await hs.batch(st); made.push(id); }
+      await hs.staleTotals(); return J2({ ok: true, boxes: made });
     }
-    if (path === "host/promote" && M === "POST") {
-      const codes = [...new Set((body.codes || []).map(c => String(c || "").trim().toUpperCase()).filter(Boolean))].slice(0, 2000);
-      const uniq = (codes.length ? await hs.list("bags", { code: codes }, "id") : []).filter(b => ["bagged", "labelled", "promoted"].includes(b.status));
-      if (uniq.length) { const ts = now(), cs = uniq.map(b => b.code);
-        for (let i = 0; i < cs.length; i += 80) { await hs.update("bags", { code: cs.slice(i, i + 80) }, { status: "promoted", promoted_at: ts }); await hs.update("qrcodes", { code: cs.slice(i, i + 80), status: "open" }, { status: "issued" }); } }
-      const sel = Array.isArray(body.lots) && body.lots.length ? new Set(body.lots.map(Number)) : null;
-      const lots = await R.lotsByCode(uniq.map(b => b.code));
-      const items = uniq.flatMap(b => lots.get(b.code) || []).filter(c => !sel || sel.has(c.id));
-      return J2({ ok: true, n: uniq.length, bsx: bsxXml(items) });
+    if (path === "host/batch") {
+      const bx = await hs.list("boxes", {}, "id desc", 60), bags = bx.length ? await hs.list("bags", { box_id: bx.map(x => x.id), status: { ne: "void" } }, "id") : [];
+      return J2({ boxes: bx.map(x => { const bs = bags.filter(b => b.box_id === x.id); return { ...x, nbags: bs.length, session_id: bs.find(b => b.session_id)?.session_id || null }; }) });
     }
-  }
-  if (path === "pick") {
-    const cut = Date.now() - 12 * 36e5;
-    const rows = [...await hs.list("bags", { status: "promoted" }), ...(await hs.list("bags", { status: "picked", picked_at: { gt: new Date(cut).toISOString().replace("T", " ").slice(0, 19) } }))]
-      .sort((a, b) => (a.location || "ZZZ").localeCompare(b.location || "ZZZ") || a.part.localeCompare(b.part));
-    return J2({ rows: await R.bagsOut(rows) });
-  }
-  if ((m = path.match(/^pick\/([\w-]+)$/)) && M === "POST") {
-    const b = await R.bag(m[1]); if (!b) return E2(`${m[1]} is not a known bag`, 404);
-    if (b.status !== "promoted") return E2(`${b.code} is not on the pick list (${b.status})`);
-    Object.assign(b, { status: "picked", picked_at: now() }); await hs.update("bags", { id: b.id }, { status: b.status, picked_at: b.picked_at }); return J2({ ok: true, code: b.code, bag: await R.bagOut(b) });
+    if ((m = path.match(/^host\/sheet\/(\d+)$/))) {
+      const box = await hs.get("boxes", { id: +m[1] }); if (!box) return E2("not found", 404);
+      const bags = await hs.list("bags", { box_id: box.id, status: { ne: "void" } }, "id");
+      return J2({ box, bags: bags.map((b, i) => ({ code: b.code, n: i + 1, session_id: b.session_id || null })) });
+    }
   }
   if (path === "putaway" && M === "POST") {
     const b = await R.bag(body.code), shelf = String(body.shelf || "").trim().toUpperCase();

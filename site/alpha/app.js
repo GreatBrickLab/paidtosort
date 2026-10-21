@@ -14,7 +14,11 @@ async function palette() { if (!PAL) { PAL = await (await fetch("/alpha/data/pal
 const SHARDS = {};
 function candidates(p) { const c = [p]; let m = p.match(/^(\d+[a-z]?)(pb|pr|pat)\d+/); if (m) c.push(m[1]); if (/^\d+[a-z]$/.test(p)) c.push(p.slice(0, -1)); if (/^\d+$/.test(p)) c.push(p + "b", p + "a"); return c; }
 async function partInfo(p) { for (const q of candidates(p)) { const k = q.slice(0, 3).toLowerCase().replace(/[^a-z0-9]/g, "_").padEnd(3, "_"); if (!SHARDS[k]) SHARDS[k] = fetch(`/alpha/data/pc/${k}.json`).then(r => r.ok ? r.json() : {}).catch(() => ({}));
-    const d = (await SHARDS[k])[q]; if (d) return { name: d[0], colors: d[1] }; } return { name: "", colors: [] }; }
+    const d = (await SHARDS[k])[q]; if (d) return withShared(p, { name: d[0], colors: d[1] }); } return withShared(p, { name: "", colors: [] }); }
+// shared parts data imported by host admins (Host > Import parts file): adds names + colors the bundled catalog lacks
+const SHARED_PI = {};
+async function withShared(p, info) { const sp = await (SHARED_PI[p] || (SHARED_PI[p] = api("parts/info?p=" + encodeURIComponent(p)).then(j => (j.parts || {})[p] || null).catch(() => null)));
+  if (!sp) return info; return { name: info.name || sp.name || "", colors: [...info.colors, ...(sp.colors || []).filter(c => !info.colors.includes(c))] }; }
 // "Undetermined Type" catalog entries are never offered or listed
 async function isUndetermined(p) { return /undetermined/i.test((await partInfo(p)).name || ""); }
 let MOLDEX = null; const moldEx = () => MOLDEX || (MOLDEX = api("mold-exceptions").then(j => new Set((j.parts || []).map(x => x.part))).catch(() => new Set()));
@@ -42,7 +46,6 @@ function attachScan(btn, vid, onCode) { if (!("BarcodeDetector" in window) || !n
 const CS_HTML = `<dialog id="cs" class="sheet"><div class="card"><div class="cshead"><h3>Color for <span id="cs_part" class="mono"></span></h3><button type="button" class="btn ghost small" id="cs_x">✕</button></div>
   <input id="cs_q" type="search" enterkeyhint="done" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Type to search colors" autocomplete="off">
   <div id="cs_body"></div><label class="small tick" style="margin-top:8px"><input type="checkbox" id="cs_all" style="width:auto;display:inline"> Show all colors</label></div></dialog>`;
-const detectorChoice = () => localStorage.getItem("pts_detector") === "brickator" ? "brickator" : "standard";   // per phone; default Standard
 const V = {}; let FIRST = true, SESS_OPEN = false; const LASTK = () => "pts_last_sid:" + (ME?.host?.id ?? "") + ":" + (ME?.user?.username || "");   // first screen after the app (re)starts: auto-resume the last open session
 V.login = () => { main.innerHTML = `<div class="login"><img src="/alpha/pts-mark.png" class="bigmark" alt="Paid to Sort"><h1>Sign in</h1><p class="muted">Sort parts. Get paid.</p><p class="err" id="err"></p>
   <form class="card" id="lf"><label>Username<input name="username" autocomplete="username" autocapitalize="none" required></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button class="btn gold wide">Sign in</button></form></div>`;
@@ -56,31 +59,31 @@ V.home = async () => { const j = await api("me?stats=1"); ME = j; header();
   main.innerHTML = `<h1>Hi ${esc(j.user.display || j.user.username)}</h1>${op ? `<a class="btn gold wide big" id="resume" href="#/s/${op.id}">▶ Resume session <span class="mono">${op.id}</span></a>` : ""}<button class="btn ${op ? "" : "gold "}wide big" id="start">＋ Start a sorting session</button>
   <p class="muted small">Pay: ${h.pay_mode === "hr" ? `$${h.rate_hr.toFixed(2)} per hour` : `$${h.rate_lb.toFixed(2)} per lb sorted`}</p>
   <h2>Recent sessions</h2>${j.sessions.map(s => `<a class="row card" href="#/s/${s.id}"><b class="mono">${s.id}</b><span class="muted small">${s.nb} bags · ${s.pcs} pcs</span>${pill(s.status)}</a>`).join("") || `<p class="muted">No sessions yet.</p>`}
-  <div class="stat card"><div><b>${(j.stats || {}).nb ?? (j.stats || {}).n ?? "–"}</b><span>bags in repository</span></div><div><b>${(j.stats || {}).n ?? "–"}</b><span>part lots</span></div><div><b>${(j.stats || {}).pcs ?? "–"}</b><span>pieces</span></div></div>
+  <div class="stat card"><div><b>${(j.stats || {}).nb ?? (j.stats || {}).n ?? "–"}</b><span>bags sorted</span></div><div><b>${(j.stats || {}).n ?? "–"}</b><span>part lots</span></div><div><b>${(j.stats || {}).pcs ?? "–"}</b><span>pieces</span></div></div>
   <p class="center"><a href="#/putaway" class="btn">Put-away</a> ${j.user.role === "admin" ? `<a href="#/host/settings" class="btn">Host settings</a>` : ""} <a href="#/logout" class="btn ghost">Sign out</a></p>`;
   $("#start").onclick = async () => { const r = await api("session/start", {}); location.hash = "#/s/" + r.id; }; };
 
 V.session = async (sid) => { await palette(); const j = await api("session/" + sid); if (j.error) { main.innerHTML = `<p class="err">${esc(j.error)}</p>`; return; }
-  const s = j.s, open = s.status === "open"; SESS_OPEN = open;
+  const s = j.s, open = s.status === "open"; SESS_OPEN = open; SBAGS = j.bags;
   main.innerHTML = `<div class="sess"><div><small class="muted">Session</small><h1 class="mono">${s.id}</h1></div>${pill(s.status)}</div>
   <p class="muted small">${esc(j.owner)} · started ${s.started.slice(5, 16)} UTC · ${esc(j.pay)}</p>
   ${open ? `<div class="card upload"><label class="btn gold wide big" for="cam">📷 Take photo of parts</label><input id="cam" type="file" accept="image/*" capture="environment" hidden>
    <label class="btn wide" for="pick">Upload a photo</label><input id="pick" type="file" accept="image/*" hidden>
    <p class="muted small">Lay parts flat and apart on a plain surface. Parts are found on your phone, then each crop is sent to the identification engine.</p>
-   <label class="small detsel">Detector <select id="detsel"><option value="standard">Standard</option><option value="brickator">Brickator (demo)</option></select></label>
    <p class="small trainnote">ⓘ Part photos help improve detection.</p><button type="button" class="btn wide" id="missbtn" hidden>＋ Missed a part?</button>
    <div id="prog" class="prog" hidden><div class="spin"></div><span id="progt">Working…</span></div><canvas id="prev" class="prev" hidden></canvas><div id="review" class="review" hidden></div></div>` : ""}
+  <div id="openbar">${open ? openBarHTML() : ""}</div>
   <h2>Verify <span class="muted small" id="pend">${j.cards.length} to check</span></h2>
-  <p class="muted small">Swipe up on a card’s <b>⇡ bar</b> to confirm it (or tap ✓); scroll anywhere else. Confirmed lots go into the <b>open bag</b> (one QR label per bag) until you tap <b>Close bag</b> or <b>Start new bag</b>.</p>
+  <p class="muted small">Swipe up on a card’s <b>⇡ bar</b> to confirm it (or tap ✓); scroll anywhere else. Confirmed lots go into the bag you picked above (scan the box’s master QR, then a bag QR).</p>
   <div id="cards">${j.cards.map(c => cardHTML(c)).join("")}</div>
-  <button type="button" class="btn gold wide big" id="confirmall" ${j.cards.length ? "" : "hidden"}>✓ Confirm all <span id="ca_n">${j.cards.length}</span> cards into the open bag</button>
+  <button type="button" class="btn gold wide big" id="confirmall" ${j.cards.length ? "" : "hidden"}>✓ Confirm all <span id="ca_n">${j.cards.length}</span> cards into the selected bag</button>
   <h2>Bags <span class="muted small">${j.bags.length}</span></h2>
-  <p id="bagbtns" ${j.bags.length ? "" : "hidden"}><a class="btn gold" href="#/labels?session=${s.id}">🖨 Print 2×1″ labels</a> <a class="btn" href="#/boxes">Put bags in a box</a></p>
-  <div id="openbar">${open ? openBarHTML(j.bags.find(b => b.open)) : ""}</div><div id="bags" class="flatlist baglist">${[...j.bags].reverse().map((b, i, a) => bagHTML(b, { n: i + 1, open: b.open || (!a.some(x => x.open) && i === a.length - 1) })).join("")}</div><p class="muted small" id="swipehint" ${j.bags.length ? "" : "hidden"}>Tap a bag to show its parts. Swipe a part <b>left</b> to edit it or remove it from the bag.</p>
+  <p id="bagbtns" ${j.bags.length ? "" : "hidden"}><a class="btn" id="invdl" href="/alpha/api/export/session/${s.id}" download="${s.id}.bsx">⬇ Download inventory file</a></p>
+  <div id="bags" class="flatlist baglist">${[...j.bags].filter(b => (b.lots || []).length || b.open).reverse().map((b, i, a) => bagHTML(b, { n: i + 1, open: b.open || (!a.some(x => x.open) && i === a.length - 1) })).join("")}</div><p class="muted small" id="swipehint" ${j.bags.length ? "" : "hidden"}>Tap a bag to show its parts. Swipe a part <b>left</b> to edit it or remove it from the bag.</p>
   ${open ? `<form class="card" id="endf"><h3>Finish session</h3>${ME.host.pay_mode === "lb" ? `<label>Weight sorted (lb)<input name="w" type="number" step="0.01" min="0" inputmode="decimal"></label>` : ""}<button class="btn wide">End session</button></form>` : ""}
 ${CS_HTML}`;
   if (open) { ["#cam", "#pick"].forEach(id => $(id).onchange = e => processPhoto(sid, e.target.files[0]));
-    $("#detsel").value = detectorChoice(); $("#detsel").onchange = e => { localStorage.setItem("pts_detector", e.target.value); toast(e.target.value === "brickator" ? "Detector: Brickator (demo). Downloads ~15 MB on the next photo." : "Detector: Standard"); };
+   
     $("#endf").onsubmit = async e => { e.preventDefault(); await api(`session/${sid}/end`, { weight_lb: e.target.w?.value || null }); await trainCheck(sid, true); route(); }; }
   wireCards(j.cards); wireBags($("#bags")); wireOpenBar();
   if (open) { localStorage.setItem(LASTK(), sid); resumeReview(sid); } else if (localStorage.getItem(LASTK()) === sid) localStorage.removeItem(LASTK());
@@ -122,33 +125,41 @@ async function missedDialog(sid) { const r = (await PTSTrain.pendingFor(sid))[0]
   d.onclose = () => { if (d.dataset.added) route(); }; draw(); d.showModal(); }
 const chip = (id, on) => `<button type="button" class="chip${on ? " on" : ""}" data-c="${id}" title="${esc(cname(id))}"><i style="background:#${crgb(id)}"></i><span>${esc(cname(id))}</span></button>`;
 const quickIds = c => { const g = (c.color_guesses || []).filter(x => x !== c.color); return [c.color, ...g].filter((x, i, a) => a.indexOf(x) === i).slice(0, 4); };
+// top alternates from identification: one tap switches the card's part (color and qty kept)
+const altHTML = c => { const as = (c.alts || []).filter(a => a.id !== c.part).slice(0, 3);
+  return (as.length ? `<div class="small muted">Other matches</div><div class="chips">${as.map(a => `<button type="button" class="chip alt" data-p="${esc(a.id)}" data-n="${esc(a.name || "")}"><img src="${img(a.id, c.color)}" alt="" onerror="this.style.visibility='hidden'"><span><b class="mono">${esc(a.id)}</b> ${esc((a.name || "").slice(0, 28))} <small class="muted">${Math.round((a.score || 0) * 100)}%</small></span></button>`).join("")}</div>` : ""); };
 const cardHTML = (c, lot) => `<div class="pcard${lot ? " lotedit" : ""}" data-id="${c.id}"${lot ? ` data-lot="${c.id}"` : ""} data-part="${esc(c.part)}" data-color="${c.color}" data-qty="${c.qty}">
  <button type="button" class="colorbtn"><i style="background:#${crgb(c.color)}"></i><span class="cn">${esc(cname(c.color))}</span><small>change ▾</small></button>
  <div class="quick">${quickIds(c).map(id => chip(id, id === c.color)).join("")}</div>
  <div class="pimg"><img src="${img(c.part, c.color)}" onerror="this.onerror=null;this.src='${c.crop || ""}'" alt=""></div>
  <div class="pinfo"><div class="pn mono">${esc(c.part)}</div><div class="nm">${esc(c.name)}</div>
- <div class="qty"><button type="button" class="qbtn minus" aria-label="less">−</button><b>${c.qty}</b><button type="button" class="qbtn plus" aria-label="more">+</button></div>${c.confidence < 0.7 ? `<div class="warn small">low confidence ${Math.round(c.confidence * 100)}%</div>` : ""}</div>
+ <div class="qty"><button type="button" class="qbtn minus" aria-label="less">−</button><b>${c.qty}</b><button type="button" class="qbtn plus" aria-label="more">+</button></div>${c.confidence < 0.7 ? `<div class="warn small flagl">⚠ Low match ${Math.round(c.confidence * 100)}%: double-check</div>` : `<div class="small muted">match ${Math.round(c.confidence * 100)}%</div>`}</div>
+ <div class="altbox">${altHTML(c)}</div>
  ${c.crop ? `<div class="pcrop"><img src="${c.crop}" alt="photo of this part" draggable="false"><span>your photo</span></div>` : ""}
  <div class="mold" hidden></div>
  ${lot ? `<div class="pact"><button type="button" class="btn gold done">Done</button></div>` : `<div class="pact"><button class="btn gold ok">✓</button><button class="btn ghost drop">Drop</button></div><div class="grip" aria-label="swipe up here to confirm">⇡ swipe up here to confirm</div>`}</div>`;
 const lotHTML = l => `<div class="lot" data-lot="${l.id}"><div class="lacts"><button type="button" class="lact ledit">Edit</button><button type="button" class="lact ldel">Delete</button></div>
  <div class="lfront"><img src="${img(l.part, l.color)}" class="thumb" alt="" onerror="this.style.visibility='hidden'"><span class="grow"><b>${l.qty}×</b> <span class="mono">${esc(l.part)}</span> · ${esc(l.color_name || cname(l.color))}<br><span class="small muted">${esc((l.name || "").slice(0, 44))}</span></span><span class="sw">‹</span></div></div>`;
 // session list: parts sit directly under each other (no QR/code between parts); the QR lives on the bag view + label only
-// explicit bag controls on the session screen: "Close bag" (closes the open bag) and "Start new bag" (closes it and opens an empty one). Photos go into the open bag.
-const openBarHTML = b => `<div class="card openbar" data-code="${b ? b.code : ""}"><div class="obtxt">${b ? `<b>Open bag</b> · ${(b.lots || []).length} part${(b.lots || []).length === 1 ? "" : "s"} · ${(b.lots || []).reduce((a, l) => a + l.qty, 0)} pcs` : `<b>No open bag</b> · the next confirmed part starts one`}</div>
-  <div class="row2 bagbtns2"><button type="button" class="btn closebag" ${b ? "" : "disabled"}>Close bag</button><button type="button" class="btn gold newbag">＋ Start new bag</button></div></div>`;
+// bags come from the admin's batch-prep sheet (no printing in the sorter app)
+// box + bag picker on the session screen: the sorter scans the box's master QR (from the batch-prep sheet), then scans or taps a bag QR; photos and the parts list go to that bag
+let SBAGS = [];
+const bagNo = b => { if (!b.box_id && b.box_id !== 0) return null; const same = SBAGS.filter(x => x.box_id === b.box_id).sort((a, c) => a.id - c.id); return same.findIndex(x => x.code === b.code) + 1 || null; };
+const openBarHTML = () => { const boxes = [...new Set(SBAGS.filter(b => b.box_code).map(b => b.box_code))], op = SBAGS.find(b => b.open);
+  return `<div class="card openbar boxpanel" data-code="${op ? op.code : ""}"><div class="obtxt">${boxes.length ? `<b>Box ${boxes.map(esc).join(", ")}</b>` : `<b>Scan the box’s master QR to start</b>`}${op ? ` · photos go to <b>Bag ${bagNo(op) || "?"}</b> <span class="mono small muted">${op.code}</span>` : boxes.length ? ` · <b>pick a bag</b>` : ""}</div>
+  <div class="scanrow"><input id="bxscan" placeholder="Scan or type the box or bag QR" autocapitalize="characters" autocomplete="off"><button type="button" class="btn small gold" id="bxgo">Go</button><button type="button" class="btn small" id="bxcam" hidden>📷 Scan</button></div><video id="bxvid" class="scanvid" hidden playsinline muted></video>
+  ${boxes.map(bc => `<p class="small muted">Bags in box ${esc(bc)}: tap one or scan its QR</p><div class="chips bagpick">${SBAGS.filter(b => b.box_code === bc).sort((a, c) => a.id - c.id).map(b => { const pcs = (b.lots || []).reduce((a, l) => a + l.qty, 0);
+    return `<button type="button" class="chip bagsel${b.open ? " on" : ""}" data-code="${b.code}" ${b.status !== "labelled" ? "disabled" : ""}><span><b>Bag ${bagNo(b)}</b>${pcs ? ` · ${pcs} pcs` : ""}</span></button>`; }).join("")}</div>`).join("")}</div>`; };
 function wireOpenBar() { const ob = $("#openbar .openbar"); if (!ob) return; const sid = location.hash.match(/#\/s\/([\w-]+)/)?.[1];
-  ob.querySelector(".closebag").onclick = async () => { const code = ob.dataset.code; if (!code) return; const j = await api(`bag/${code}/close`, {});
-    if (j.ok) { replaceBag(j.bag); updateOpenBar(j.bag); toast("Bag closed. The next confirmed part starts a new bag."); } else toast(j.error || "failed"); };
-  ob.querySelector(".newbag").onclick = async () => { const j = await api(`session/${sid}/newbag`, {}); if (!j.ok) return toast(j.error || "failed");
-    (j.closed || []).forEach(replaceBag); $$("#bags details.bagc").forEach(d => { if (bagOpenPref(d.dataset.code) !== true) d.open = false; });
-    $("#bags").insertAdjacentHTML("beforeend", bagHTML(j.bag, { n: $$("#bags .bagc").length + 1, open: true })); wireBags($("#bags"), $("#bags .bagc:last-child"));
-    $("#bagbtns").hidden = false; $("#swipehint").hidden = false; updateOpenBar(j.bag); toast("New bag started. Confirmed parts go into it."); }; }
-function updateOpenBar(b) { const ob = $("#openbar"); if (!ob) return; const cur = ob.querySelector(".openbar")?.dataset.code;
-  if (b.open) ob.innerHTML = openBarHTML(b); else if (cur === b.code) ob.innerHTML = openBarHTML(null); wireOpenBar(); }
+  const go = async code => { code = String(code || "").trim(); if (!code) return; const j = await api(`session/${sid}/scan`, { code }); if (!j.ok) return toast(j.error || "failed", 3500);
+    SBAGS = j.bags || SBAGS; toast(j.bag ? `Photos now go to Bag ${bagNo(j.bag) || ""} (${j.bag.code})` : "Box linked. Pick a bag."); route(); };
+  $("#bxgo").onclick = () => go($("#bxscan").value); $("#bxscan").onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); go($("#bxscan").value); } };
+  ob.querySelectorAll(".bagsel").forEach(b => b.onclick = () => go(b.dataset.code)); attachScan($("#bxcam"), $("#bxvid"), go); }
+function updateOpenBar(b) { const ob = $("#openbar"); if (!ob || !b) return; const i = SBAGS.findIndex(x => x.code === b.code);
+  if (b.open) SBAGS.forEach(x => x.open = false); if (i >= 0) SBAGS[i] = b; else SBAGS.push(b); ob.innerHTML = openBarHTML(); wireOpenBar(); }
 const bagHTML = (b, flat) => { const lots = b.lots || [], pcs = lots.reduce((a, l) => a + l.qty, 0);
   if (flat) { const st = bagOpenPref(b.code); const isOpen = st === null ? flat.open : st;
-    return `<details class="bagc flat${b.open ? " active" : ""}" data-code="${b.code}"${isOpen ? " open" : ""}><summary class="bagsum"><span class="caret">▸</span><b class="bagn">Bag ${flat.n || ""}</b><span class="small muted">${lots.length} part${lots.length === 1 ? "" : "s"} · ${pcs} pcs</span>${b.open ? pill("Adding here", "open") : ""}${SESS_OPEN ? `<button type="button" class="bagcam${b.status === "labelled" ? "" : " locked"}" data-st="${esc(b.status)}" aria-label="Take a photo and add parts to this bag">📷<span>add parts</span></button>` : ""}</summary>
+    return `<details class="bagc flat${b.open ? " active" : ""}" data-code="${b.code}"${isOpen ? " open" : ""}><summary class="bagsum"><span class="caret">▸</span><b class="bagn">Bag ${bagNo(b) || flat.n || ""}</b><span class="small muted">${lots.length} part${lots.length === 1 ? "" : "s"} · ${pcs} pcs</span>${b.open ? pill("Adding here", "open") : ""}${SESS_OPEN ? `<button type="button" class="bagcam${b.status === "labelled" ? "" : " locked"}" data-st="${esc(b.status)}" aria-label="Take a photo and add parts to this bag">📷<span>add parts</span></button>` : ""}</summary>
   <div class="lots">${lots.map(lotHTML).join("") || `<p class="muted small empty">No parts yet${b.open ? ". Take a photo and confirm parts to add them here." : "."}</p>`}</div>
   ${!b.open && b.status === "labelled" && SESS_OPEN ? `<button type="button" class="btn small reopen">↺ Reopen · add parts here</button>` : ""}</details>`; }
   return `<div class="bag bagc card" data-code="${b.code}"><div class="baghead"><img src="${qrURL(b.code)}" class="qr" alt=""><div class="grow"><b class="mono">${b.code}</b> ${b.open ? pill("open bag", "open") : ""}<br>
@@ -169,7 +180,7 @@ function wireBags(root, only) { if (!root) return;
       bagEl.open = !bagEl.open; setBagOpen(bagEl.dataset.code, bagEl.open); }; }
     // 📷 on a bag row: make this bag the open one (reopen if closed) and start the camera right away (file picker needs the tap's user gesture)
     const bc = bagEl.querySelector(".bagcam"); if (bc) bc.onclick = async e => { e.preventDefault(); e.stopPropagation();
-      if (bc.classList.contains("locked")) return toast(`${bagEl.querySelector(".bagn")?.textContent || "This bag"} is already ${bc.dataset.st}, so parts can't be added. Use “Start new bag”.`, 3500);
+      if (bc.classList.contains("locked")) return toast(`${bagEl.querySelector(".bagn")?.textContent || "This bag"} is already ${bc.dataset.st}, so parts can't be added. Scan or pick another bag of the box.`, 3500);
       $("#cam")?.click();
       if (bagEl.classList.contains("active")) return; const j = await api(`bag/${bagEl.dataset.code}/reopen`, {}); if (!j.ok) return toast(j.error || "failed");
       (j.closed || []).forEach(replaceBag); replaceBag(j.bag); updateOpenBar(j.bag); toast(`Adding to ${bagEl.querySelector(".bagn")?.textContent || "this bag"}`); };
@@ -207,7 +218,7 @@ function wireCards(cards, els) { els = els || $$(".pcard:not(.lotedit)");
   const ca = $("#confirmall"); if (ca && !els.some(e => e.classList.contains("lotedit"))) ca.onclick = async () => { ca.disabled = true;
     await new Promise(r => setTimeout(r, 450)); await Q;   // let pending qty saves land first
     const todo = $$(".pcard:not(.lotedit):not(.going):not(.dropping)"); for (const el of todo) await confirmCard(el);
-    ca.disabled = false; left(); toast(`Confirmed ${todo.length} card${todo.length === 1 ? "" : "s"} into the open bag`); };
+    ca.disabled = false; left(); toast(`Confirmed ${todo.length} card${todo.length === 1 ? "" : "s"} into the selected bag`); };
   els.forEach(el => {
     const isLot = el.classList.contains("lotedit");
     if (!isLot) el.querySelector(".ok").onclick = () => confirmCard(el);
@@ -258,6 +269,13 @@ function wireCards(cards, els) { els = els || $$(".pcard:not(.lotedit)");
   $("#cs_all").onchange = renderSheet; $("#cs_x").onclick = () => $("#cs").close();
   els.forEach(el => { el.querySelector(".colorbtn").onclick = () => openSheet(el); wireQuick(el); renderMold(el);
     const pc = el.querySelector(".pcrop"); if (pc) pc.onclick = e => { e.stopPropagation(); e.preventDefault(); openZoom(+el.dataset.id, pc.querySelector("img").src); }; });
+  // ---- alternates / part number: same edit as the mold switch, then the mold double-check re-runs for the new part
+  const setPart = async (el, part, name) => { if (!name) name = (await partInfo(part)).name || ""; const j = await api(ep(el), { action: "edit", part, name }); if (!j.ok) return toast(j.error || "failed");
+    el.dataset.part = j.part; const c = byId[el.dataset.id]; if (c) { c.part = j.part; c.name = j.name; }
+    el.querySelector(".pn").textContent = j.part; el.querySelector(".nm").textContent = j.name; el.querySelector(".pimg img").src = img(j.part, j.color);
+    el.querySelector(".altbox").innerHTML = altHTML({ ...(c || {}), part: j.part, color: j.color }); wireAlts(el); renderMold(el); toast(`Set to ${j.part} (color and qty kept)`); };
+  const wireAlts = el => el.querySelectorAll(".chip.alt").forEach(b => b.onclick = () => setPart(el, b.dataset.p, b.dataset.n));
+  els.forEach(wireAlts);
   // ---- mold variants: notice + one-tap switch (keeps color and qty)
   async function renderMold(el) { const box = el.querySelector(".mold"), m = (await moldMap())[el.dataset.part], ex = await moldEx();
     const name = el.querySelector(".nm").textContent;
@@ -305,23 +323,19 @@ async function openZoom(cardId, cropSrc) { $("#zoom")?.remove();
   cv.onpointerup = cv.onpointercancel = e => { pts.delete(e.pointerId); if (pts.size < 2) last = null; if (!moved && pts.size === 0 && !inImg(e.clientX, e.clientY)) close(); };
   cv.onwheel = e => { e.preventDefault(); const f = Math.exp(-e.deltaY / 300); tx0 = e.clientX - (e.clientX - tx0) * f; ty0 = e.clientY - (e.clientY - ty0) * f; s *= f; draw(); };
   draw(); }
-let cvReady = null;
-function loadCV() { if (!cvReady) cvReady = new Promise((res, rej) => { const s = document.createElement("script"); s.src = "/alpha/vendor/opencv.js"; s.async = true;
-  s.onload = () => { const done = () => res(); if (window.cv && cv.Mat) done(); else if (window.cv instanceof Promise) cv.then(m => { window.cv = m; done(); }); else cv.onRuntimeInitialized = done; }; s.onerror = rej; document.head.appendChild(s); }); return cvReady; }
 async function processPhoto(sid, file) {
   if (!file) return; const prog = $("#prog"), pt = $("#progt"); prog.hidden = false;
   try {
-    const det = detectorChoice(), demo = det === "brickator";
-    // DEMO ONLY: Brickator runs in onnxruntime-web and is only downloaded when switched on; the standard finder still provides the colour helpers
-    pt.textContent = demo ? "Loading Brickator (demo) part finder (first time ~15 MB download)…" : "Loading part finder (first time ~10 MB)…";
-    const tl = performance.now(); await Promise.all([demo ? PTSBrickator.load() : loadCV(), palette()]); const loadMs = Math.round(performance.now() - tl);
+    // the ONNX part finder is the only detector (onnxruntime-web, model downloaded once and cached by the browser)
+    pt.textContent = "Loading part finder (first time ~15 MB)…";
+    const tl = performance.now(); await Promise.all([PTSBrickator.load(), palette()]); const loadMs = Math.round(performance.now() - tl);
     pt.textContent = "Finding parts…";
     const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
     const sc = Math.min(1, 3200 / Math.max(bmp.width, bmp.height)); const cvs = document.createElement("canvas"); cvs.width = Math.round(bmp.width * sc); cvs.height = Math.round(bmp.height * sc);
     cvs.getContext("2d").drawImage(bmp, 0, 0, cvs.width, cvs.height);
     await new Promise(r => setTimeout(r, 30));
-    const td = performance.now(); const parts = demo ? await PTSBrickator.detect(cvs) : PTSDetect.detect(cvs);
-    window.PTS_LAST_DETECT = { detector: demo ? PTSBrickator.VER : "cv-blob-1", load_ms: loadMs, detect_ms: Math.round(performance.now() - td), boxes: parts.length, ...(demo ? { infer_ms: PTSBrickator.stats.infer_ms, paper: PTSBrickator.stats.paper } : {}) };
+    const td = performance.now(); const parts = await PTSBrickator.detect(cvs);
+    window.PTS_LAST_DETECT = { detector: PTSBrickator.VER, load_ms: loadMs, detect_ms: Math.round(performance.now() - td), boxes: parts.length, infer_ms: PTSBrickator.stats.infer_ms, paper: PTSBrickator.stats.paper };
     // resume: the capture under review (photo + found boxes + boxes the sorter adds) is kept on the phone until Done
     try { await RV.put({ sid, t: Date.now(), w: cvs.width, h: cvs.height, photo: await new Promise(r => cvs.toBlob(r, "image/jpeg", 0.92)), det: window.PTS_LAST_DETECT.detector, parts: parts.map(p => ({ box: p.box, crop: p.crop, lab: p.lab, group: p.group, merged: p.merged || null })), missed: [] }); } catch (e) { console.warn("review save", e); }
     return finishPhoto(sid, cvs, parts, [], false, window.PTS_LAST_DETECT.detector);
@@ -334,7 +348,7 @@ const RV = (() => { let dbp = null; const idb = () => dbp || (dbp = new Promise(
     setMissed: async (sid, missed) => { const r = await tx("readonly", s => s.get(sid)); if (r) { r.missed = missed; await tx("readwrite", s => s.put(r)); } } }; })();
 async function resumeReview(sid) { const r = await RV.get(sid).catch(() => null); if (!r || !$("#prog")) return false;
   const im = await createImageBitmap(r.photo); const cvs = document.createElement("canvas"); cvs.width = r.w; cvs.height = r.h; cvs.getContext("2d").drawImage(im, 0, 0, r.w, r.h);
-  toast("Resumed your photo review"); finishPhoto(sid, cvs, r.parts, r.missed || [], true, r.det || "cv-blob-1"); return true; }
+  toast("Resumed your photo review"); finishPhoto(sid, cvs, r.parts, r.missed || [], true, r.det || PTSBrickator.VER); return true; }
 async function finishPhoto(sid, cvs, parts, missed0, resumed, det) {
   const prog = $("#prog"), pt = $("#progt"); prog.hidden = false;
   try {
@@ -356,18 +370,17 @@ async function finishPhoto(sid, cvs, parts, missed0, resumed, det) {
     for (const [gid, j] of Object.entries(gj)) { const mem = parts.map((p, i) => p.group == gid ? i : -1).filter(i => i >= 0), whole = res[j];
       const ids = new Set(mem.map(i => preds[i][0]?.id)), best = Math.max(...mem.map(i => preds[i][0]?.score || 0));
       if (whole.length && ids.size > 1 && whole[0].score >= best - 0.02) { const f = mem[0]; parts[f] = { ...parts[f], ...parts[f].merged }; preds[f] = whole; keep = keep.filter(i => !mem.slice(1).includes(i)); } }
-    const lines = [], idx = {}, tboxes = [], mboxes = [];
-    // detected parts and missed boxes share one path: identification -> color estimate from the part's pixels -> merge duplicates
-    const add = async (items0, lab, crop, onLine) => { const items = []; for (const it of items0) if (!(await isUndetermined(it.id))) items.push(it);
-      if (!items.length) return onLine(null, null); const top = items[0];
-      const ranked = PTSDetect.estimateColor(lab, top.id, (await partInfo(top.id)).colors, PAL), col = ranked[0]; const key = top.id + "|" + col.id;
-      const pred = { part: top.id, color: col.id, score: Math.round(top.score * 1000) / 1000 };
-      if (idx[key]) { idx[key].qty++; idx[key].confidence = Math.min(idx[key].confidence, top.score); return onLine(lines.indexOf(idx[key]), pred); }
-      lines.push(idx[key] = { part: top.id, name: top.name, color: col.id, qty: 1, confidence: Math.round(top.score * 1000) / 1000, alts: items.slice(0, 4).map(a => ({ id: a.id, name: a.name, score: Math.round(a.score * 1000) / 1000 })), crop: await shrink(crop, 220), color_guesses: ranked.slice(0, 5).map(c => c.id) });
-      onLine(lines.length - 1, pred); };
-    for (const i of keep) { const p = parts[i]; await add(preds[i], p.lab, p.crop, (line, pred) => tboxes.push({ box: p.box, line, pred })); }
-    for (let m = 0; m < missed.length; m++) await add(res[mj + m], PTSDetect.cropLab(mcrops[m]), jobs[mj + m], line => mboxes.push({ box: missed[m], line }));
-    const unk = tboxes.filter(b => b.line === null).length + mboxes.filter(b => b.line === null).length;
+    // detected parts and missed boxes share one path: identification -> color estimate from the part's pixels -> parts list (lib/partslist.js: one row per part+color, qty summed, low/unidentified flagged)
+    const dets = [...keep.map(i => ({ items: preds[i], lab: parts[i].lab, crop: parts[i].crop, box: parts[i].box, kind: "t" })), ...missed.map((b, m) => ({ items: res[mj + m], lab: PTSDetect.cropLab(mcrops[m]), crop: jobs[mj + m], box: b, kind: "m" }))];
+    const und = new Set(); for (const id of new Set(dets.flatMap(d => (d.items || []).map(it => String(it.id))))) if (await isUndetermined(id)) und.add(id);
+    for (const d of dets) { const top = (d.items || []).find(it => it.id && (!it.type || it.type === "part") && !und.has(String(it.id)));
+      if (top) { const ranked = PTSDetect.estimateColor(d.lab, top.id, (await partInfo(top.id)).colors, PAL); d.col = { color: ranked[0]?.id ?? 0, guesses: ranked.slice(0, 5).map(c => c.id) }; } }
+    const PL = PTSPartsList.buildPartsList(dets, { undetermined: id => und.has(id), colorFor: d => d.col });
+    // unidentified crops are counted (toast) but not shown or saved: the sorter notices the missing part while verifying and retakes the photo
+    const lineOf = [], lines = []; for (const r of PL.rows) { if (r.flag === "unidentified") { lineOf.push(null); continue; } lineOf.push(lines.length); lines.push({ ...PTSPartsList.toCard(r), crop: r.crop ? await shrink(r.crop, 220) : null }); }
+    const tboxes = [], mboxes = [];
+    dets.forEach((d, i) => { const r = PL.rows[PL.rowOf[i]], line = lineOf[PL.rowOf[i]]; (d.kind === "t" ? tboxes : mboxes).push({ box: d.box, line, pred: r.part === "?" ? null : { part: r.part, color: r.color, score: Math.round(((d.items || []).find(it => it.id === r.part)?.score || 0) * 1000) / 1000 } }); });
+    const unk = PL.summary.unidentified, lowN = PL.summary.low;
     pt.textContent = "Saving cards…"; const sv = await api(`session/${sid}/cards`, { cards: lines });
     if (sv.ok) await RV.del(sid).catch(() => {});
   // cards exist now: a later reload must not make them (or the training sample) again
@@ -377,7 +390,7 @@ async function finishPhoto(sid, cvs, parts, missed0, resumed, det) {
       for (const b of [...tboxes, ...mboxes]) { const id = cid(b.line); if (id) await ZM.mapCard(id, pid, b.box, 1); } } catch (e) { console.warn("zoom store", e); }     // training sample: kept on the phone until these cards are resolved, then uploaded in the background; review boxes are labelled 'missed'
     try { const tid = await PTSTrain.begin(sid, cvs, tboxes.map(b => ({ box: b.box.map(v => Math.round(v)), card_id: cid(b.line), pred: b.pred })), det);
       for (const b of mboxes) await PTSTrain.addMissed(tid, b.box.map(v => Math.round(v)), cid(b.line)); } catch (e) { console.warn("training sample", e); }
-    toast(`${total} parts${missed.length ? ` (${missed.length} added by you)` : ""} → ${lines.length} lots${unk ? ` (${unk} not recognised)` : ""}`, 3500); route();
+    toast(`${total} parts${missed.length ? ` (${missed.length} added by you)` : ""} → ${lines.length} lots${lowN ? ` · ${lowN} to double-check` : ""}${unk ? ` · ${unk} not recognised, retake the photo to try again` : ""}`, 3500); route();
   } catch (e) { pt.textContent = "Error: " + e.message; console.error(e); }
 }
 // photo review: keeps the photo on screen with the found boxes (gold); tap or drag to add a box (pink, 'missed'); Done resolves the list of missed boxes
@@ -405,13 +418,6 @@ function reviewPhoto(cvs, parts, pt, sid, missed0) { return new Promise(resolve 
   draw(); host.scrollIntoView({ block: "start" }); }); }
 function shrink(dataURL, max) { return new Promise(res => { const im = new Image(); im.onload = () => { const s = Math.min(1, max / Math.max(im.width, im.height)), c = document.createElement("canvas"); c.width = im.width * s; c.height = im.height * s; c.getContext("2d").drawImage(im, 0, 0, c.width, c.height); res(c.toDataURL("image/jpeg", 0.8)); }; im.src = dataURL; }); }
 
-V.labels = async (qs) => { await palette(); const j = await api("labels?" + qs);
-  main.innerHTML = `<div class="noprint card center"><b>${j.bags.length} bag label(s)${j.box ? " + 1 box label" : ""}</b> · 2×1″ thermal<br><button class="btn gold" onclick="print()">🖨 Print</button> <button class="btn ghost" onclick="history.back()">Back</button></div>
-  ${j.bags.map(b => { const ls = b.lots || [], shown = ls.slice(0, ls.length > 4 ? 3 : 4);
-    return `<div class="lbl" data-code="${b.code}"><img class="q" src="${qrURL(b.code)}" alt=""><div class="t"><span class="c">${b.code}</span><ul class="lc">${shown.map(l => `<li>${l.qty}× <b>${esc(l.part)}</b> ${esc(l.color_name)}</li>`).join("")}${ls.length > shown.length ? `<li>+${ls.length - shown.length} more</li>` : ""}</ul>
-    <span class="meta">${ls.length} part${ls.length === 1 ? "" : "s"} · ${ls.reduce((a, l) => a + l.qty, 0)} pcs · ${b.session_id || ""}</span></div></div>`; }).join("")}
-  ${j.box ? `<div class="lbl box">${barSVG(j.box.barcode)}<div class="t">BOX ${j.box.barcode} · shelf ${esc(j.box.shelf || "—")}</div></div>` : ""}`; };
-
 V.boxes = async () => { const j = await api("boxes");
   main.innerHTML = `<h1>Boxes</h1><form class="card" id="nb"><h3>New box</h3><label>Shelf address<input name="shelf" placeholder="e.g. A-01-2" autocapitalize="characters"></label><button class="btn gold wide">Create box + batch barcode</button></form>
   ${j.boxes.map(x => `<a class="row card" href="#/box/${x.id}"><span style="max-width:130px">${barSVG(x.barcode).replace("<svg", '<svg class="bc"')}</span><span><b class="mono">${x.barcode}</b><br><span class="muted small">${x.nb} bags · ${x.pcs} pcs</span></span>${pill(x.shelf || "no shelf", "")}</a>`).join("") || `<p class="muted">No boxes yet.</p>`}`;
@@ -419,7 +425,7 @@ V.boxes = async () => { const j = await api("boxes");
 
 V.box = async (id, j) => { await palette(); j = j || await api("box/" + id); const b = j.box;
   main.innerHTML = `<h1 class="mono">Box ${b.barcode}</h1>${j.msg ? `<p class="okmsg">${esc(j.msg)}</p>` : ""}
-  <div class="card center">${barSVG(b.barcode).replace("<svg", '<svg class="bcbig"')}<br><a class="btn small" href="#/labels?box=${b.id}&codes=${j.bags.map(x => x.code).join(",")}">🖨 Box + bag labels</a></div>
+  <div class="card center">${barSVG(b.barcode).replace("<svg", '<svg class="bcbig"')}</div>
   <form class="card" id="sf"><label>Shelf address<input name="shelf" value="${esc(b.shelf || "")}" autocapitalize="characters"></label><button class="btn wide">Save shelf</button></form>
   <form class="card" id="af"><h3>Add bags</h3><label>Scan or type bag QR codes<input name="codes" id="scanin" placeholder="PTS-…" autocapitalize="characters"></label>
   ${j.loose.length ? `<p class="muted small">Or tick loose bags:</p>` + j.loose.map(x => `<label class="tick"><input type="checkbox" name="bag" value="${x.code}"><img src="${img(x.part, x.color)}" alt=""><span>${contents(x)} <span class="mono small muted">${x.code}</span></span></label>`).join("") : ""}
@@ -429,38 +435,10 @@ V.box = async (id, j) => { await palette(); j = j || await api("box/" + id); con
   $("#af").onsubmit = async e => { e.preventDefault(); const codes = e.target.codes.value.split(/[\s,]+/).filter(Boolean).concat($$("#af input[name=bag]:checked").map(x => x.value)); V.box(id, await api("box/" + id, { action: "add", codes })); };
   $$(".rm").forEach(x => x.onclick = async () => V.box(id, await api("box/" + id, { action: "remove", code: x.dataset.c }))); };
 
-V.repo = async (qs) => { await palette(); const p = new URLSearchParams(qs); const j = await api("repo?" + p.toString()); const tot = j.rows.reduce((a, b) => a + b.qty, 0);
-  main.innerHTML = `<h1>Repository</h1><form class="card search" id="rf"><input name="q" value="${esc(p.get("q") || "")}" placeholder="Part number, name or bag QR" autocapitalize="none">
-  <select name="color"><option value="">any color</option>${[...PAL].sort((a, b) => a.name.localeCompare(b.name)).map(c => `<option value="${c.id}" ${p.get("color") == c.id ? "selected" : ""}>${esc(c.name)}</option>`).join("")}</select>
-  <select name="status"><option value="">any status</option>${["labelled", "bagged", "promoted", "picked"].map(s => `<option ${p.get("status") === s ? "selected" : ""}>${s}</option>`).join("")}</select><button class="btn gold">Search</button></form>
-  <p class="muted small">${j.rows.length} bag(s) · ${j.rows.reduce((a, b) => a + (b.lots || []).length, 0)} part lot(s) · ${tot} pcs</p>
-  ${j.rows.map(b => `<a class="bag card rrow" href="#/bag/${b.code}"><img src="${img(b.part, b.color)}" class="thumb" alt=""><div class="grow">${(b.lots || []).map(l => `<div><b class="mono">${esc(l.part)}</b> · ${esc(l.color_name)} <span class="muted">× ${l.qty}</span></div>`).join("")}<span class="mono small muted">${b.code}</span></div>
-   <div class="loc"><b>${esc(b.location || "—")}</b><br><span class="small muted">${b.box_code || "loose"}</span><br>${pill(b.status)}</div></a>`).join("") || `<p class="muted">Nothing found.</p>`}`;
-  $("#rf").onsubmit = e => { e.preventDefault(); location.hash = "#/repo?" + new URLSearchParams(new FormData(e.target)).toString(); }; };
-
-function parseInventory(txt, name) { const out = [];
-  if (txt.includes("<Item>") || /\.(bsx|xml)$/i.test(name)) { for (const m of txt.matchAll(/<Item>([\s\S]*?)<\/Item>/g)) { const t = k => (m[1].match(new RegExp(`<${k}>([\\s\\S]*?)</${k}>`)) || [])[1];
-      if ((t("ItemTypeID") || "P") !== "P") continue; out.push([String(t("ItemID")).trim(), +(t("ColorID") || 0), +(t("Qty") || 0)]); } return out; }
-  const rows = txt.replace(/^\uFEFF/, "").split(/\r?\n/).filter(l => l.trim()).map(l => l.split(",").map(x => x.trim().replace(/^"|"$/g, "")));
-  const h = rows.shift().map(x => x.toLowerCase()); const pi = h.findIndex(x => ["part", "itemid", "item_id", "part_num", "item no"].includes(x)), ci = h.findIndex(x => ["color", "colorid", "color_id", "colour", "color name"].includes(x)), qi = h.findIndex(x => ["qty", "quantity", "count"].includes(x));
-  if (pi < 0) throw new Error("CSV needs a 'part' column (plus 'color' and 'qty')");
-  const byName = n => { const s = n.toLowerCase().replace(/[^a-z]/g, ""); const al = { lbg: "lightbluishgray", dbg: "darkbluishgray" }; const t = al[s] || s; return (PAL.find(c => c.name.toLowerCase().replace(/[^a-z]/g, "") === t) || {}).id ?? 0; };
-  for (const r of rows) { if (!r[pi]) continue; const cv0 = ci >= 0 ? r[ci] : "0"; out.push([r[pi], /^\d+$/.test(cv0) ? +cv0 : byName(cv0), qi >= 0 ? +r[qi] || 0 : 1]); } return out; }
-
 V.host = async () => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } await palette();
-  main.innerHTML = `<h1>Host · ${esc(ME.host.site_name)}</h1><p><a class="btn small" href="#/host/settings">Settings &amp; sorters</a> <a class="btn small" href="#/repo">Search repository</a> <a class="btn small" href="#/host/molds">Mold-variant exceptions</a> <a class="btn small" href="#/host/train">Training data</a></p>
-  <form class="card" id="cf"><h3>Compare with your store</h3><p class="muted small">Upload your store inventory file (the XML file your store software exports, or a CSV with part, color, qty). We list repository lots your store is missing or low on (under ${ME.host.low_threshold}).</p>
-  <input type="file" name="inv" accept=".bsx,.xml,.csv,text/csv" required><button class="btn gold wide">Compare</button></form><div id="cres"></div>`;
-  $("#cf").onsubmit = async e => { e.preventDefault(); const f = e.target.inv.files[0]; let items; try { items = parseInventory(await f.text(), f.name); } catch (er) { $("#cres").innerHTML = `<p class="err">${esc(er.message)}</p>`; return; }
-    const j = await api("host/compare", { items });
-    $("#cres").innerHTML = `<h2>Gaps <span class="muted small">${j.res.length} lots · ${esc(f.name)} (${j.n_inv} lines)</span></h2><p><label class="small"><input type="checkbox" id="all" style="display:inline;width:auto"> select all</label></p>
-    ${j.res.map(r => `<label class="bag card tick2"><input type="checkbox" class="pb" value="${r.code}" data-lot="${r.lot_id}" ${r.status === "promoted" ? "disabled" : ""}><img src="${img(r.part, r.color)}" class="thumb" alt=""><div class="grow"><b class="mono">${esc(r.part)}</b> · ${esc(r.color_name)}<br><span class="small">repo × ${r.qty} · store has ${r.store_qty}</span><br><span class="small muted">${esc(r.location || "no shelf")} · ${r.code}</span></div>${pill(r.status === "promoted" ? "promoted" : r.tag)}</label>`).join("") || `<p class="muted">Your store already has everything in the repository.</p>`}
-    ${j.res.length ? `<button class="btn gold wide big" id="prom">★ Promote selected + export store inventory file</button>` : ""}`;
-    $("#all") && ($("#all").onclick = ev => $$(".pb:not([disabled])").forEach(x => x.checked = ev.target.checked));
-    $("#prom") && ($("#prom").onclick = async () => { const codes = [...new Set($$(".pb:checked").map(x => x.value))]; if (!codes.length) return toast("Tick some lots first");
-      const r = await api("host/promote", { codes, lots: $$(".pb:checked").map(x => +x.dataset.lot) }); const blob = new Blob([r.bsx], { type: "application/xml" }); window.PTS_LAST_EXPORT = r.bsx;
-      sessionStorage.setItem("pts_export", URL.createObjectURL(blob)); location.hash = "#/pick?exported=" + r.n; }); }; };
-
+  main.innerHTML = `<h1>Host · ${esc(ME.host.site_name)}</h1><p><a class="btn small" href="#/host/settings">Settings &amp; sorters</a> <a class="btn small gold" href="#/host/batch">Batch prep · print box sheets</a> <a class="btn small" href="#/host/molds">Mold-variant exceptions</a> <a class="btn small" href="#/host/train">Training data</a> <a class="btn small" href="#/host/parts">Import parts file</a></p>
+  <div class="card"><h3>Download inventory file</h3><p class="muted small">All confirmed lots from every sorting session of this host, one line per part and color (.bsx file, price 0, condition used).</p><a class="btn wide" id="hostdl" href="/alpha/api/host/export" download>⬇ Download inventory file</a></div>
+`; };
 V.hostSettings = async (j, msg) => { j = j || await api("host"); if (j.error) { main.innerHTML = `<p class="err">${esc(j.error)}</p>`; return; } const h = j.host;
   main.innerHTML = `<h1>Host settings</h1>${msg ? `<p class="okmsg">${esc(msg)}</p>` : ""}<form class="card" id="hs"><label>Host site name<input name="site_name" value="${esc(h.site_name)}"></label>
   <label>Pay sorters<select name="pay_mode"><option value="lb" ${h.pay_mode === "lb" ? "selected" : ""}>per lb sorted</option><option value="hr" ${h.pay_mode === "hr" ? "selected" : ""}>per hour</option></select></label>
@@ -473,6 +451,19 @@ V.hostSettings = async (j, msg) => { j = j || await api("host"); if (j.error) { 
   $("#hs").onsubmit = async e => { e.preventDefault(); const r = await api("host/settings", fo(e.target)); await loadMe(); V.hostSettings(null, r.msg || r.error); };
   $("#as").onsubmit = async e => { e.preventDefault(); const r = await api("host/sorter", fo(e.target)); V.hostSettings(null, r.msg || r.error); }; };
 
+// ---- batch prep (admin): make boxes with N bag QRs and print one sheet per box (master QR + bag 1..N QRs with write-in lines). Labels are printed here, not by sorters.
+V.hostBatch = async () => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } const j = await api("host/batch");
+  main.innerHTML = `<h1>Batch prep</h1><p class="muted small">Before the sorter leaves: print one sheet per box. The sorter scans the box’s master QR, then a bag QR to choose where photos and parts go.</p>
+  <form class="card" id="bf"><div class="row2"><label>Boxes<input name="boxes" type="number" min="1" max="20" value="1" inputmode="numeric"></label><label>Bags per box<input name="bags" type="number" min="1" max="30" value="6" inputmode="numeric"></label></div>
+  <label>Shelf address (optional)<input name="shelf" autocapitalize="characters" placeholder="e.g. A-01-2"></label><button class="btn gold wide">Create boxes + bag QRs</button></form>
+  <h2>Boxes <span class="muted small">${j.boxes.length}</span></h2><div id="bxlist">${j.boxes.map(x => `<div class="row card"><b class="mono">${esc(x.barcode)}</b><span class="small grow">${x.nbags} bag QR${x.nbags === 1 ? "" : "s"}${x.session_id ? ` · in use: <span class="mono">${esc(x.session_id)}</span>` : " · not used yet"}</span>${x.nbags ? `<a class="btn small gold" href="#/host/sheet/${x.id}">🖨 Sheet</a>` : ""}</div>`).join("") || `<p class="muted">No boxes yet.</p>`}</div>`;
+  $("#bf").onsubmit = async e => { e.preventDefault(); const f = e.target, r = await api("host/batch", { boxes: +f.boxes.value, bags: +f.bags.value, shelf: f.shelf.value }); if (!r.ok) return toast(r.error || "failed");
+    location.hash = r.boxes.length === 1 ? "#/host/sheet/" + r.boxes[0] : "#/host/batch"; if (r.boxes.length > 1) V.hostBatch(); }; };
+V.hostSheet = async id => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } const j = await api("host/sheet/" + id); if (j.error) { main.innerHTML = `<p class="err">${esc(j.error)}</p>`; return; }
+  main.innerHTML = `<div class="noprint card center"><b>Box sheet · ${j.bags.length} bag QR${j.bags.length === 1 ? "" : "s"}</b><br><button class="btn gold" id="prt">🖨 Print</button> <a class="btn ghost" href="#/host/batch">Back</a></div>
+  <div class="sheet-print"><div class="master"><img class="q" src="${qrURL(j.box.barcode)}" alt=""><div><div class="small">BOX · scan first</div><div class="c mono">${esc(j.box.barcode)}</div>${j.box.shelf ? `<div class="small">Shelf ${esc(j.box.shelf)}</div>` : ""}<div class="wl">Sorter</div><div class="wl">Date</div></div></div>
+  <div class="bagqrs">${j.bags.map(b => `<div class="bq"><img class="q" src="${qrURL(b.code)}" alt=""><div class="t"><b>Bag ${b.n}</b><span class="mono small">${esc(b.code)}</span><div class="wl"></div><div class="wl"></div></div></div>`).join("")}</div></div>`;
+  $("#prt").onclick = () => print(); };
 V.hostMolds = async (msg) => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; }
   const j = await api("mold-exceptions"), mm = await moldMap();
   main.innerHTML = `<h1>Mold-variant exceptions</h1><p class="muted small">Parts on this list never show the "Double-check: mold variant" notice and are never offered as a variant chip. Shared by all hosts.</p>
@@ -483,21 +474,6 @@ V.hostMolds = async (msg) => { if (ME?.user.role !== "admin") { main.innerHTML =
   const after = r => { MOLDEX = null; V.hostMolds(r.ok ? "Saved." : "✗ " + (r.error || "failed")); };
   $("#mf").onsubmit = async e => { e.preventDefault(); after(await api("host/mold-exceptions", { action: "add", part: e.target.part.value, note: e.target.note.value })); };
   $$(".rmx").forEach(b => b.onclick = async () => { if (confirm("Remove " + b.dataset.p + " from the exception list?")) after(await api("host/mold-exceptions", { action: "remove", part: b.dataset.p })); }); };
-
-V.pick = async (qs) => { const p = new URLSearchParams(qs); const j = await api("pick"); const todo = j.rows.filter(r => r.status === "promoted").length; const ex = sessionStorage.getItem("pts_export");
-  main.innerHTML = `<h1>Pick sheet</h1>${p.get("exported") && ex ? `<p class="okmsg">Promoted ${esc(p.get("exported"))} lot(s). <a href="${ex}" download="promoted-lots.bsx" id="dl">⬇ Download store inventory file for these lots</a></p>` : ""}
-  <p class="muted small"><span id="left">${todo}</span> to pull · sorted by shelf address · scan the bag QR or tap ✓</p>
-  <div class="card scan"><input id="scan" placeholder="Scan / type bag QR" autocapitalize="characters" autocomplete="off"><button class="btn gold" id="go">✓</button><button class="btn" id="camscan" hidden>📷</button></div>
-  <video id="vid" playsinline hidden></video><p id="msg" class="small"></p>
-  <div id="picklist">${j.rows.map(b => `<div class="prow card ${b.status === "picked" ? "done" : ""}" data-code="${b.code}"><div class="shelf">${esc(b.location || "—")}</div><img src="${img(b.part, b.color)}" class="thumb" alt="">
-   <div class="grow">${(b.lots || []).map(l => `<b>${l.qty}× ${esc(l.part)}</b> <span class="small">${esc(l.color_name)}</span><br>`).join("")}<span class="mono small muted">${b.code}${b.box_code ? " · " + b.box_code : ""}</span></div><button class="btn gold tap">✓</button></div>`).join("") || `<p class="muted">Nothing to pick. Promote lots from Host.</p>`}</div>
-  <p class="center"><a href="#/putaway" class="btn">Put-away mode</a></p>`;
-  const pickIt = async code => { code = code.trim().toUpperCase(); if (!code) return; const r = await api("pick/" + encodeURIComponent(code), {}); const m = $("#msg");
-    if (r.ok) { document.querySelector(`.prow[data-code="${code}"]`)?.classList.add("done"); m.textContent = "✓ " + code + " picked: " + (r.bag?.lots || []).map(l => `${l.qty}× ${l.part} ${l.color_name}`).join(", "); m.className = "okmsg small"; $("#left").textContent = $$(".prow:not(.done)").length; }
-    else { m.textContent = "✗ " + r.error; m.className = "err small"; } };
-  $$(".tap").forEach(b => b.onclick = () => pickIt(b.closest(".prow").dataset.code));
-  const s = $("#scan"); $("#go").onclick = () => { pickIt(s.value); s.value = ""; }; s.onkeydown = e => { if (e.key === "Enter") { pickIt(s.value); s.value = ""; } };
-  attachScan($("#camscan"), $("#vid"), pickIt); };
 
 V.putaway = () => { main.innerHTML = `<h1>Put-away</h1><p class="muted small">1) Scan the bag QR · 2) scan the shelf address (or a box barcode). Typing works too.</p>
   <div class="card"><label>1 · Bag QR<input id="code" placeholder="PTS-…" autocapitalize="characters" autocomplete="off"></label><label>2 · Shelf address or box<input id="shelf" placeholder="A-01-2 or BX0100001" autocapitalize="characters" autocomplete="off"></label>
@@ -513,12 +489,29 @@ V.putaway = () => { main.innerHTML = `<h1>Put-away</h1><p class="muted small">1)
 const contents = b => (b.lots || []).map(l => `${l.qty}× ${esc(l.part)} ${esc(l.color_name)}`).join(", ") || "empty";
 V.bag = async code => { SESS_OPEN = false; await palette(); const j = await api("bag/" + encodeURIComponent(code)); if (!j.bag) { main.innerHTML = `<p class="err">${esc(j.error || "not found")}</p>`; return; } const b = j.bag;
   main.innerHTML = `<h1>Bag</h1><div id="bags">${bagHTML(b)}</div><p class="muted small">Swipe a part <b>left</b> to edit it or remove it from this bag.</p>
-  <p><a class="btn small" href="#/labels?codes=${b.code}">🖨 Print label</a> ${b.session_id ? `<a class="btn small" href="#/s/${b.session_id}">Session</a>` : ""}</p>${CS_HTML}`; wireBags($("#bags")); };
+  <p>${b.session_id ? `<a class="btn small" href="#/s/${b.session_id}">Session</a>` : ""}</p>${CS_HTML}`; wireBags($("#bags")); };
 V.hostTrain = async msg => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } const j = await api("host/train");
   main.innerHTML = `<h1>Training data</h1><p class="muted small">Part photos from sorting (with what sorters confirmed, dropped, corrected or added) go into one shared pool that improves part detection for every host. Samples hold no names, logins, sessions or pay.</p>
   ${msg ? `<p class="okmsg">${esc(msg)}</p>` : ""}<div class="stat card"><div><b id="t_host">${j.host ?? 0}</b><span>samples from this host</span></div><div><b id="t_total">${j.total ?? 0}</b><span>samples in the shared pool</span></div></div>
   <button class="btn wide" id="t_del" ${j.host ? "" : "disabled"}>Delete this host's samples</button>`;
   $("#t_del").onclick = async () => { if (!confirm(`Delete all ${j.host} training samples from this host? This cannot be undone.`)) return; const r = await api("host/train/delete", {}); V.hostTrain(r.ok ? `Deleted ${r.deleted} sample(s).` : r.error); }; };
+V.hostParts = async msg => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; }
+  main.innerHTML = `<h1>Import parts file</h1><p><a class="btn small" href="#/host">← Host</a></p>${msg ? `<p class="okmsg">${esc(msg)}</p>` : ""}
+  <form class="card" id="pf"><p class="muted small">Load an inventory file (.bsx) exported from your inventory software. Part numbers, part names and the colors in the file are added to the shared parts list that the color picker on the verify card uses. Only part data is shared with other hosts; your customers, sorters and sessions are not. Up to 5 MB / 20,000 lines.</p>
+  <input type="file" name="f" accept=".bsx,.xml" required><button class="btn gold wide">Read file</button></form><div id="pres"></div>`;
+  $("#pf").onsubmit = async e => { e.preventDefault(); const f = e.target.f.files[0]; if (!f) return; let r;
+    try { if (f.size > PTSInvFile.LIMITS.bytes) throw new Error("File is larger than 5 MB."); r = PTSInvFile.parse(await f.text()); } catch (er) { $("#pres").innerHTML = `<p class="err">${esc(er.message)}</p>`; return; }
+    if (!r.parts.length) { $("#pres").innerHTML = `<p class="err">No parts found in ${esc(f.name)}.</p>`; return; }
+    const nc = r.parts.reduce((a, p) => a + p.colors.length, 0);
+    $("#pres").innerHTML = `<h2>${r.parts.length} parts <span class="muted small">${nc} part/color pairs · ${r.items} lines${r.skipped ? ` · ${r.skipped} skipped (not parts or unreadable)` : ""}</span></h2>
+    <div class="flatlist">${r.parts.slice(0, 30).map(p => `<div class="row card"><b class="mono">${esc(p.part)}</b><span class="small grow">${esc(p.name || "")}</span><span class="muted small">${p.colors.map(c => esc(c.name || "#" + c.id)).join(", ")}</span></div>`).join("")}</div>
+    ${r.parts.length > 30 ? `<p class="muted small">…and ${r.parts.length - 30} more</p>` : ""}<button class="btn gold wide big" id="pimp">Import ${r.parts.length} parts</button>`;
+    $("#pimp").onclick = async () => { $("#pimp").disabled = true; const t = { added: 0, updated: 0, unchanged: 0, colors_added: 0, n_errors: 0 };
+      for (let i = 0; i < r.parts.length; i += 500) { $("#pimp").textContent = `Importing… ${i}/${r.parts.length}`; const j = await api("host/parts/import", { parts: r.parts.slice(i, i + 500) });
+        if (j.error) { $("#pres").insertAdjacentHTML("beforeend", `<p class="err">${esc(j.error)}</p>`); return; } for (const k in t) t[k] += j[k] || 0; }
+      Object.keys(SHARED_PI).forEach(k => delete SHARED_PI[k]);
+      V.hostParts(`Imported: ${t.added} new parts, ${t.updated} updated, ${t.unchanged} unchanged${t.colors_added ? `, ${t.colors_added} new colors` : ""}${t.n_errors ? `, ${t.n_errors} rows rejected` : ""}.`); }; }; };
+
 // ---------------- router
 async function loadMe() { const j = await api("me"); ME = j.error ? null : j; header(); return ME; }
 function header() { $("#who").textContent = ME ? `${ME.host.site_name} · ${ME.user.username}` : ""; $("#tabs").hidden = !ME; $("#hosttab").hidden = !(ME && ME.user.role === "admin"); }
@@ -526,22 +519,22 @@ async function route() {
   const h = location.hash.slice(1) || "/", [path, qs] = h.split("?");
   if (path === "/logout") { await api("logout", {}); ME = null; header(); location.hash = "#/login"; return; }
   if (path !== "/login" && !ME && !(await loadMe())) { location.hash = "#/login"; return; }
-  const tab = path.startsWith("/box") ? "box" : path.startsWith("/repo") ? "repo" : path.startsWith("/pick") || path.startsWith("/putaway") ? "pick" : path.startsWith("/host") ? "host" : "sort";
+  const tab = path.startsWith("/box") ? "box" : path.startsWith("/putaway") ? "box" : path.startsWith("/host") ? "host" : "sort";
   $$("#tabs a").forEach(a => a.classList.toggle("on", a.dataset.t === tab));
   let m; window.scrollTo(0, 0);
   if (path === "/login") return V.login();
   if (path === "/") return V.home();
   if ((m = path.match(/^\/s\/([\w-]+)$/))) return V.session(m[1]);
-  if (path === "/labels") return V.labels(qs || "");
   if ((m = path.match(/^\/bag\/([\w-]+)$/))) return V.bag(m[1]);
   if (path === "/boxes") return V.boxes();
   if ((m = path.match(/^\/box\/(\d+)$/))) return V.box(m[1]);
-  if (path === "/repo") return V.repo(qs || "");
   if (path === "/host") return V.host();
   if (path === "/host/settings") return V.hostSettings();
   if (path === "/host/molds") return V.hostMolds();
   if (path === "/host/train") return V.hostTrain();
-  if (path === "/pick") return V.pick(qs || "");
+  if (path === "/host/parts") return V.hostParts();
+  if (path === "/host/batch") return V.hostBatch(qs || "");
+  if ((m = path.match(/^\/host\/sheet\/(\d+)$/))) return V.hostSheet(m[1]);
   if (path === "/putaway") return V.putaway();
   main.innerHTML = `<p>Not found. <a href="#/">Home</a></p>`;
 }

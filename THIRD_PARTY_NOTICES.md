@@ -5,7 +5,6 @@ Paid to Sort is AGPL-3.0-or-later (see LICENSE). It includes or calls the compon
 | Component | Version | Location | License | Notes |
 |---|---|---|---|---|
 | onnxruntime-web (Microsoft) | 1.30.0 | site/alpha/vendor/ort/ | MIT | Include Microsoft's MIT copyright notice. |
-| OpenCV.js (OpenCV) | 4.x | site/alpha/vendor/opencv.js | Apache-2.0 (OpenCV 4.5+) | Include the Apache-2.0 text and the OpenCV NOTICE. |
 | JsBarcode (Johan Lindell) | 3.11.6 | site/alpha/vendor/JsBarcode.min.js | MIT | Header kept. |
 | qrcode-generator (Kazuhiko Arase) | 1.4.4 | site/alpha/vendor/qrcode.min.js | MIT | "QR Code" is a registered trademark of DENSO WAVE. |
 | Brickator detector weights (YOLO11n-seg "lego_brick") | exported with Ultralytics 8.4.126 | site/alpha/models/brickator-y11n-seg-1024.onnx | AGPL-3.0 (license field in the model's own metadata); the upstream README says MIT but has no LICENSE file | Treat as AGPL-3.0. Get the upstream author to confirm in writing. |
