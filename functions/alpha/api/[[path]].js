@@ -41,6 +41,24 @@ function pay(s, host) {
   return s.weight_lb ? `$${(s.weight_lb * host.rate_lb).toFixed(2)} (${s.weight_lb} lb × $${host.rate_lb.toFixed(2)})` : "weight not entered";
 }
 // A bag (one PTS- QR) holds many lots. Lots are the confirmed cards whose bag_code is the bag's code; removed lots get status "removed".
+// ---- open-bag meter: running weight (g), bag volume (cm3), pieces and parts value from the shared parts data.
+// Bag volume uses loose bulk density (a 4x6 in bag holds ~250-300 cm3 / ~100-120 g of loose parts -> ~0.4 g/cm3, host setting loose_density):
+//   weight known -> weight_g / loose_density; no weight -> bounding-box volume_cm3 x 0.6 packing fraction (approximate); neither -> 0 (approximate).
+// Bag-full uses only weight and volume (never prices): full when weight >= bag_max_g OR volume >= bag_max_cm3, whichever comes first.
+const PACKING = 0.6;
+async function meterOf(sh, lots, host, caps) { caps = caps || { max_g: +host.bag_max_g || 0, max_cm3: +host.bag_max_cm3 || 0, share: 0, size: null };
+  const { metrics, prices } = await sh.partData(lots.map(l => l.part)), dens = +host.loose_density > 0 ? +host.loose_density : 0.4;
+  let g = 0, v = 0, cm3 = 0, pcs = 0, nW = 0, nP = 0, nD = 0;
+  for (const l of lots) { const q = +l.qty || 0, mt = metrics.get(l.part), pr = prices.get(l.part + "|" + l.color); pcs += q;
+    if (mt && mt.has_weight && mt.weight_g > 0) { g += q * mt.weight_g; cm3 += q * mt.weight_g / dens; }
+    else { nW++; if (mt && mt.has_dims && mt.volume_cm3 > 0) cm3 += q * mt.volume_cm3 * PACKING; else nD++; }
+    if (pr && pr.price_used_avg > 0) v += q * pr.price_used_avg; else nP++; }
+  const share = +caps.share || 0;   // the sorter's own pay share (users.pay_share), 0 = parts value only
+  const byW = caps.max_g > 0 && g >= caps.max_g, byV = caps.max_cm3 > 0 && cm3 >= caps.max_cm3, full = lots.length > 0 && (byW || byV);
+  return { lots: lots.length, pcs, weight_g: Math.round(g * 10) / 10, volume_cm3: Math.round(cm3), value: Math.round(v * 100) / 100, share,
+    earnings: share > 0 ? Math.round(v * share * 100) / 100 : null, no_weight: nW, no_price: nP, no_size: nD, approx: nW + nP > 0, full,
+    full_by: full ? (byW && byV ? "weight and volume" : byW ? "weight" : "volume") : null,
+    max_g: +caps.max_g || 0, max_cm3: +caps.max_cm3 || 0, bag_size: caps.size }; }
 const lotOut = c => ({ id: c.id, part: c.part, name: c.name, color: c.color, color_name: colorName(c.color), qty: c.qty, color_guesses: c.color_guesses || [], crop: c.crop || null });
 
 // Per-request data access: every read is an indexed query for just the rows the endpoint needs (all through the hostStore gatekeeper).
@@ -57,8 +75,12 @@ function repo(hs) {
       const qrs = new Map((await hs.list("qrcodes", { code: [...new Set(codes)] })).map(q => [q.code, q]));
       const bids = [...new Set(bags.map(b => b.box_id).filter(x => x !== null && x !== undefined))];
       const boxes = new Map((bids.length ? await hs.list("boxes", { id: bids }) : []).map(x => [x.id, x]));
-      return bags.map(b => { const q = qrs.get(b.code); const o = { ...b, color_name: colorName(b.color), box_code: boxes.get(b.box_id)?.barcode || null, lots: (lots.get(b.code) || []).map(lotOut), open: q?.status === "open" };
-        if (withQr) o.qr = q; return o; }); },
+      const out = bags.map(b => { const q = qrs.get(b.code); const o = { ...b, color_name: colorName(b.color), box_code: boxes.get(b.box_id)?.barcode || null, lots: (lots.get(b.code) || []).map(lotOut), open: q?.status === "open" };
+        if (withQr) o.qr = q; return o; });
+      for (const o of out) if (o.box_id !== null && o.box_id !== undefined) o.n = await R.bagN(o);   // number within its box, same as the seal toast and batch summary
+      return out; },
+    openLots: async sid => (await hs.list("cards", { session_id: sid, status: "confirmed", bag_code: null }, "id")).map(cardIn),
+    bagN: async b => (await hs.list("bags", { box_id: b.box_id, status: { ne: "void" } }, "id")).findIndex(x => x.code === b.code) + 1 || null,
     bagOut: async b => (await R.bagsOut([b]))[0],
     // keep the bag row's summary columns (first lot + total qty) in step with its lots
     syncBag: async b => { const ls = await R.lots(b), f = ls[0] || {}, q = ls.reduce((a, c) => a + c.qty, 0), nm = ls.length > 1 ? `${ls.length} lots` : (f.name || "");
@@ -163,6 +185,12 @@ export async function onRequest(ctx) {
   // only the logged-in user's host, through the gatekeeper; each endpoint below reads just the rows it needs
   const hs = hostStore(D1, ck.hid), R = repo(hs);
   const user = await hs.get("users", { id: ck.uid });
+  // bag caps come from the box's bag size (host list bag_sizes; first size if the box has none; host bag_max_* if the host has no sizes);
+  // pay share is the session sorter's own users.pay_share
+  const SZ = {}; const capsOf = async s => { const k = (s?.box_id ?? "-") + ":" + (s?.user_id ?? "-"); if (SZ[k]) return SZ[k];
+    const box = s?.box_id ? await hs.get("boxes", { id: s.box_id }) : null, sizes = await hs.list("bag_sizes", {}, "id");
+    const z = (box?.bag_size_id && sizes.find(x => x.id === box.bag_size_id)) || sizes[0] || null, su = s && s.user_id !== user.id ? await hs.get("users", { id: s.user_id }) : user;
+    return SZ[k] = { max_g: z ? +z.max_g : +host.bag_max_g || 0, max_cm3: z ? +z.max_cm3 : +host.bag_max_cm3 || 0, size: z ? z.name : null, share: +su?.pay_share || 0 }; };
   if (!user) return E2("login required", 401);
   const host = await hs.get("hosts", {});
   if (!host) return E2("login required", 401);
@@ -193,10 +221,17 @@ export async function onRequest(ctx) {
     const owner = s.user_id === user.id ? user : await hs.get("users", { id: s.user_id });
     const cards = (await hs.list("cards", { session_id: s.id, status: "pending" }, "id")).map(cardIn).map(c => ({ ...c, color_name: colorName(c.color) }));
     const bags = await R.bagsOut(await hs.list("bags", { session_id: s.id, status: { ne: "void" } }, "id desc"));
-    return J2({ s, pay: pay(s, host), owner: owner?.username, cards, bags });
+    const openLots = (await R.openLots(s.id)).map(lotOut), box = s.box_id ? await hs.get("boxes", { id: s.box_id }) : null;
+    const sealed = bags.filter(b => b.lots.length), per = [];
+    for (const b of sealed) per.push({ code: b.code, n: b.box_id === s.box_id ? await R.bagN(b) : null, ...(await meterOf(sh, b.lots, host, await capsOf(s))) });
+    const tot = { bags: per.length, pcs: per.reduce((a, b) => a + b.pcs, 0), weight_g: Math.round(per.reduce((a, b) => a + b.weight_g, 0) * 10) / 10, value: Math.round(per.reduce((a, b) => a + b.value, 0) * 100) / 100,
+      approx: per.some(b => b.approx), batch_weight_g: box?.batch_weight_g ?? null, share: +(await capsOf(s)).share || 0 };
+    tot.earnings = tot.share > 0 ? Math.round(tot.value * tot.share * 100) / 100 : null;
+    return J2({ s, pay: pay(s, host), owner: owner?.username, cards, bags, box, open_lots: openLots, meter: await meterOf(sh, openLots, host, await capsOf(s)), summary: { ...tot, per_bag: per } });
   }
   if ((m = path.match(/^session\/([\w-]+)\/end$/)) && M === "POST") {
     const s = await sess(m[1]); if (!mine(s)) return E2("not found", 404);
+    if ((await R.openLots(s.id)).length && !body.force) return E2("The open bag still has parts: scan a bag label to seal them first", 409);
     await hs.put("sessions", { ...s, status: "closed", ended: now(), weight_lb: body.weight_lb ? +body.weight_lb : null }); return J2({ ok: true });
   }
   if (path === "identify" && M === "POST") {
@@ -204,7 +239,8 @@ export async function onRequest(ctx) {
     if (!b64 || b64.length > 3e6) return E2("bad image");
     const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
     const fd = new FormData(); fd.append("query_image", new Blob([bin], { type: "image/jpeg" }), "crop.jpg");
-    const r = await fetch("https://api.brickognize.com/predict/", { method: "POST", body: fd, headers: { accept: "application/json" } });
+    const r = await fetch("https://api.brickognize.com/predict/", { method: "POST", body: fd, headers: { accept: "application/json" }, signal: AbortSignal.timeout(8000) }).catch(() => null);
+    if (!r) return E2("identification timed out", 504);
     if (!r.ok) return E2("identification engine error " + r.status, 502);
     const js = await r.json();
     return J2({ items: (js.items || []).slice(0, 5).map(it => ({ id: it.id, name: it.name, score: +it.score || 0, type: it.type || "part" })) });
@@ -245,13 +281,12 @@ export async function onRequest(ctx) {
     if (body.qty) c.qty = Math.max(1, +body.qty);
     if (body.action === "confirm" && !validPart(c.part)) return E2("this card has no part number", 400);
     if (body.action === "confirm") {
-      // the session's open bag collects confirmed lots until "Close bag"; no open bag -> start a new one (one QR per bag)
-      const open = (await hs.list("qrcodes", { session_id: s.id, status: "open" })).map(q => q.code);
-      let bag = open.length ? (await hs.list("bags", { code: open, session_id: s.id, status: "labelled" }, "id"))[0] : null;
-      if (!bag) return E2("Scan the box QR and pick a bag first", 409);
-      c.status = "confirmed"; c.bag_code = bag.code; await hs.put("cards", cardRow(c)); await R.syncBag(bag); await hs.staleTotals();
+      // confirmed lots collect in the session's open bag (bag_code null) until a bag label is scanned to seal them
+      if (!s.box_id) return E2("Scan the box master QR first", 409);
+      c.status = "confirmed"; c.bag_code = null; await hs.put("cards", cardRow(c));
       if (c.image_id) await sh.confirmIdentification(c.image_id, c.part, c.color);
-      return J2({ ok: true, code: bag.code, bag: await R.bagOut(bag), part: c.part, color: c.color, color_name: colorName(c.color), qty: c.qty, name: c.name });
+      const ol = await R.openLots(s.id);
+      return J2({ ok: true, lot: lotOut(c), open_lots: ol.map(lotOut), meter: await meterOf(sh, ol, host, await capsOf(s)), part: c.part, color: c.color, color_name: colorName(c.color), qty: c.qty, name: c.name });
     }
     await hs.put("cards", cardRow(c));
     return J2({ ok: true, part: c.part, name: c.name, color: c.color, color_name: colorName(c.color), qty: c.qty });
@@ -290,40 +325,47 @@ export async function onRequest(ctx) {
     await hs.update("qrcodes", { code: b.code }, { status: "open", expires: Date.now() + QR_TTL });
     return J2({ ok: true, bag: await R.bagOut(b), closed: await R.bagsOut(closed) });
   }
-  // sorter: scan the box master QR (links the box's prepared bags to this session) or a bag QR (that bag gets the photos / parts list)
+  // sorter: scan the box master QR at the start (links the batch's box to this session), then a bag QR from that box's sheet seals the open bag into it
   if ((m = path.match(/^session\/([\w-]+)\/scan$/)) && M === "POST") {
     const s = await sess(m[1]); if (!mine(s) || s.status !== "open") return E2("session not open");
-    const code = String(body.code || "").trim().toUpperCase(); let box = null, bag = null;
-    if (/^BX\d+$/.test(code)) box = await hs.get("boxes", { barcode: code });
-    else { bag = await R.bag(code); if (!bag || bag.status === "void") return E2(`${code}: not a known box or bag QR`, 404);
-      if (!bag.session_id) { if (bag.box_id === null || bag.box_id === undefined) return E2("this bag QR is not on a prepared box sheet"); box = await hs.get("boxes", { id: bag.box_id }); }
-      else if (bag.session_id !== s.id) return E2("this bag belongs to another sorting session", 409); }
-    if (!box && !bag) return E2(`${code}: not a known box QR`, 404);
-    if (box) { const bs = await hs.list("bags", { box_id: box.id, status: { ne: "void" } }, "id");
-      if (!bs.length) return E2("this box has no bag QRs; print its sheet from Batch prep");
+    const code = String(body.code || "").trim().toUpperCase();
+    if (/^BX\d+$/.test(code)) { const box = await hs.get("boxes", { barcode: code }); if (!box) return E2(`${code}: not a known box QR`, 404);
+      if (s.box_id && s.box_id !== box.id) return E2("this session already works on another box", 409);
+      if (box.sorter_id && box.sorter_id !== s.user_id) return E2("this box is prepared for another sorter", 409);
+      if ((await hs.list("sessions", { box_id: box.id })).some(x => x.id !== s.id)) return E2("this box is already used by another sorting session", 409);
+      const bs = await hs.list("bags", { box_id: box.id, status: { ne: "void" } }, "id"); if (!bs.length) return E2("this box has no bag QRs; print its sheet from Batch prep");
       if (bs.some(b => b.session_id && b.session_id !== s.id)) return E2("this box is already used by another sorting session", 409);
-      const free = bs.filter(b => !b.session_id).map(b => b.code);
-      for (let i = 0; i < free.length; i += 80) { const cs = free.slice(i, i + 80); await hs.update("bags", { code: cs }, { session_id: s.id, user_id: s.user_id }); await hs.update("qrcodes", { code: cs }, { session_id: s.id, user_id: s.user_id }); }
-      if (!bag) { const open = await hs.list("qrcodes", { session_id: s.id, status: "open" }); if (!open.some(q => bs.some(b => b.code === q.code))) bag = bs.find(b => b.status === "labelled") || null; } }
-    if (bag) { bag = await R.bag(bag.code); const q = await R.qr(bag.code);
-      if (bag.status !== "labelled" || !q || !["open", "issued"].includes(q.status)) return E2("this bag is already bagged, boxed or expired", 409);
-      await R.closeOpen(s.id, bag.code); await hs.update("qrcodes", { code: bag.code }, { status: "open" }); }
-    return J2({ ok: true, bag: bag ? await R.bagOut(bag) : null, bags: await R.bagsOut(await hs.list("bags", { session_id: s.id, status: { ne: "void" } }, "id")) });
+      s.box_id = box.id; await hs.update("sessions", { id: s.id }, { box_id: box.id });
+      return J2({ ok: true, box, sealed: null }); }
+    const bag = await R.bag(code); if (!bag || bag.status === "void") return E2(`${code}: not a known box or bag QR`, 404);
+    if (!s.box_id) return E2("Scan the box master QR first", 409);
+    if (bag.box_id !== s.box_id) return E2("this bag label belongs to another box", 409);
+    if (bag.session_id && bag.session_id !== s.id) return E2("this bag belongs to another sorting session", 409);
+    if (bag.status !== "labelled" || (await R.lots(bag)).length) return E2("this bag label is already used; scan an unused bag label of this box", 409);
+    const ol = await R.openLots(s.id); if (!ol.length) return E2("The open bag is empty: confirm some parts first", 409);
+    await hs.batch([hs.updateStmt("cards", { id: ol.map(c => c.id) }, { bag_code: bag.code }), hs.updateStmt("bags", { id: bag.id }, { session_id: s.id, user_id: s.user_id, status: "bagged" }),
+      hs.updateStmt("qrcodes", { code: bag.code }, { session_id: s.id, user_id: s.user_id, status: "used" })]);
+    Object.assign(bag, { session_id: s.id, user_id: s.user_id, status: "bagged" }); await R.syncBag(bag); await hs.staleTotals();
+    const bo = await R.bagOut(bag);
+    return J2({ ok: true, sealed: { ...bo, n: await R.bagN(bag), meter: await meterOf(sh, bo.lots, host, await capsOf(s)) } });
   }
   if ((m = path.match(/^bag\/([\w-]+)\/close$/)) && M === "POST") {
     const b = await R.bag(m[1]); if (!b || !mine(await sess(b.session_id))) return E2("not found", 404);
     await hs.update("qrcodes", { code: b.code, status: "open" }, { status: "issued" }); return J2({ ok: true, bag: await R.bagOut(b) });
   }
   if ((m = path.match(/^lot\/(\d+)$/)) && M === "POST") {   // a lot inside a bag: edit color/qty/part, remove from bag, or undo the removal
-    const c = cardIn(await hs.get("cards", { id: +m[1] })); const s = c && c.bag_code && await sess(c.session_id);
-    const b = s && await R.bag(c.bag_code); if (!b || !s || s.host_id !== host.id || !(admin || s.user_id === user.id || b.user_id === user.id)) return E2("not found", 404);
+    const c = cardIn(await hs.get("cards", { id: +m[1] })); const s = c && await sess(c.session_id);
+    const b = s && c.bag_code ? await R.bag(c.bag_code) : null;   // no bag_code: the lot is in the session's open bag
+    if (!s || (c.bag_code && !b) || s.host_id !== host.id || !(admin || s.user_id === user.id || b?.user_id === user.id)) return E2("not found", 404);
     if (body.action === "remove") c.status = "removed";
     else if (body.action === "restore") c.status = "confirmed";
     else { if (c.status !== "confirmed") return E2("this part was removed from the bag", 409);
       if (body.part && body.part !== c.part) { const np = String(body.part).trim().slice(0, 40); if (!validPart(np)) return E2("bad part number"); c.part = np; c.name = String(body.name || ""); }
       if (body.color !== undefined && body.color !== "") c.color = +body.color;
       if (body.qty) c.qty = Math.max(1, +body.qty); }
-    await hs.put("cards", cardRow(c)); await R.syncBag(b); await hs.staleTotals();
+    await hs.put("cards", cardRow(c));
+    if (!b) { const ol = await R.openLots(s.id); return J2({ ok: true, id: c.id, status: c.status, part: c.part, name: c.name, color: c.color, color_name: colorName(c.color), qty: c.qty, open_lots: ol.map(lotOut), meter: await meterOf(sh, ol, host, await capsOf(s)) }); }
+    await R.syncBag(b); await hs.staleTotals();
     return J2({ ok: true, id: c.id, status: c.status, part: c.part, name: c.name, color: c.color, color_name: colorName(c.color), qty: c.qty, bag: await R.bagOut(b) });
   }
   if ((m = path.match(/^bag\/([\w-]+)\/bagged$/)) && M === "POST") {
@@ -362,6 +404,7 @@ export async function onRequest(ctx) {
     const xml = inventoryXml(lotsFromCards(cards.filter(c => !c.bag_code || !voids.has(c.bag_code))), { colorName: id => (PALETTE[id] || [""])[0] });
     return new Response(xml, { headers: { "content-type": "application/xml; charset=utf-8", "content-disposition": `attachment; filename="${fname}"`, "cache-control": "no-store", "x-robots-tag": "noindex, nofollow" } }); };
   if ((m = path.match(/^export\/session\/([\w-]+)$/)) && M === "GET") {
+    if (!admin) return E2("host admins only", 403);   // inventory files are a host-admin export, not a sorter download
     const s = await sess(m[1]); if (!mine(s)) return E2("not found", 404);
     return invFile(await hs.list("cards", { session_id: s.id, status: "confirmed" }, "id"), `${s.id}.bsx`); }
   if (path === "host/export" && M === "GET") {   // all of this host's sessions, or ?sessions=S-1,S-2
@@ -395,7 +438,7 @@ export async function onRequest(ctx) {
     if (!admin) return E2("host admins only", 403);
     if (path === "host") { const us = await hs.list("users", {}, "id"), ns = new Map((await hs.group("sessions", "user_id")).map(r => [r.k, r.n]));
       const ss = await hs.list("sessions", {}, "started desc", 30), un = new Map(us.map(u => [u.id, u.username]));
-      return J2({ host, users: us.map(u => ({ username: u.username, display: u.display, role: u.role, ns: ns.get(u.id) || 0 })), sessions: ss.map(s => ({ ...s, username: un.get(s.user_id), pay: pay(s, host) })) }); }
+      return J2({ host, users: us.map(u => ({ username: u.username, display: u.display, role: u.role, ns: ns.get(u.id) || 0, pay_share: +u.pay_share || 0 })), bag_sizes: await hs.list("bag_sizes", {}, "id"), sessions: ss.map(s => ({ ...s, username: un.get(s.user_id), pay: pay(s, host) })) }); }
     // delete whole sessions (cards, bags, QR codes, crops) and boxes, e.g. data made by automated test runs.
     // {sessions: [...], boxes: [...], dry: true} returns the rows (with crops when backup: true) without deleting anything.
     if (path === "host/purge" && M === "POST") {
@@ -420,22 +463,41 @@ export async function onRequest(ctx) {
       return J2({ ok: true, deleted: Object.fromEntries(Object.entries(rows).map(([k, v]) => [k, v.length])) });
     }
     if (path === "host/settings" && M === "POST") {
-      Object.assign(host, { site_name: String(body.site_name || host.site_name).slice(0, 80), pay_mode: body.pay_mode === "hr" ? "hr" : "lb", rate_lb: +body.rate_lb || 1.35, rate_hr: +body.rate_hr || 10, low_threshold: Math.max(1, +body.low_threshold || 3) });
+      Object.assign(host, { site_name: String(body.site_name || host.site_name).slice(0, 80), pay_mode: body.pay_mode === "hr" ? "hr" : "lb", rate_lb: +body.rate_lb || 1.35, rate_hr: +body.rate_hr || 10, low_threshold: Math.max(1, +body.low_threshold || 3),
+        payout_share: Math.min(1, Math.max(0, +body.payout_share || 0)), bag_max_g: Math.max(0, +(body.bag_max_g ?? host.bag_max_g ?? 110) || 0), bag_max_cm3: Math.max(0, +(body.bag_max_cm3 ?? host.bag_max_cm3) || 0),
+        loose_density: Math.min(2, Math.max(0.05, +body.loose_density || host.loose_density || 0.4)) });
       await hs.put("hosts", host); return J2({ ok: true, msg: "Settings saved." });
     }
     if (path === "host/sorter" && M === "POST") {
       const un = String(body.username || "").trim().toLowerCase();
       if (!/^[a-z0-9_.-]{3,32}$/.test(un) || String(body.password || "").length < 8) return E2("Username 3-32 letters/numbers; password 8+ characters.");
       if (await findLogin(D1, un)) return E2("That username is taken.");
-      await hs.put("users", { id: await hs.nextId("user"), username: un, pw_hash: await hashPw(body.password), role: "sorter", display: String(body.display || un).slice(0, 60), created: now() });
+      await hs.put("users", { id: await hs.nextId("user"), username: un, pw_hash: await hashPw(body.password), role: "sorter", display: String(body.display || un).slice(0, 60), created: now(), pay_share: Math.min(1, Math.max(0, +host.payout_share || 0)) });
       return J2({ ok: true, msg: `Sorter ${un} added.` });
     }
+    // per-sorter pay: share of the parts value shown to that sorter as estimated earnings (0 = show the parts value only)
+    if (path === "host/sorter/pay" && M === "POST") { const u = await hs.get("users", { username: String(body.username || "").trim().toLowerCase() }); if (!u) return E2("no such user", 404);
+      u.pay_share = Math.min(1, Math.max(0, +body.pay_share || 0)); await hs.put("users", u); return J2({ ok: true, username: u.username, pay_share: u.pay_share }); }
+    // bag sizes (host list): add / edit / remove. A size in use by a box can be edited but not removed.
+    if (path === "host/bag-sizes" && M === "GET") return J2({ sizes: await hs.list("bag_sizes", {}, "id") });
+    if (path === "host/bag-sizes" && M === "POST") { const sizes = await hs.list("bag_sizes", {}, "id"), name = String(body.name || "").trim().slice(0, 40);
+      const g = Math.max(0, +body.max_g || 0), v = Math.max(0, +body.max_cm3 || 0);
+      if (body.action === "remove") { const z = sizes.find(x => x.id === +body.id); if (!z) return E2("not found", 404);
+        if ((await hs.list("boxes", { bag_size_id: z.id }, "id", 1)).length) return E2("this bag size is used by a box; edit it instead", 409);
+        await hs.batch([hs.delStmt("bag_sizes", { id: z.id })]); return J2({ ok: true, sizes: await hs.list("bag_sizes", {}, "id") }); }
+      if (!name || !(g > 0 || v > 0)) return E2("Give the bag size a name and a gram or cm³ limit.");
+      if (body.action === "edit") { const z = sizes.find(x => x.id === +body.id); if (!z) return E2("not found", 404); Object.assign(z, { name, max_g: g, max_cm3: v }); await hs.put("bag_sizes", z); }
+      else await hs.put("bag_sizes", { id: Math.max(0, ...sizes.map(x => x.id)) + 1, name, max_g: g, max_cm3: v });
+      return J2({ ok: true, sizes: await hs.list("bag_sizes", {}, "id") }); }
     // ---- batch prep (admin, before the sorter leaves): N boxes, each = 1 master QR (box barcode) + M bag QRs (bag 1..M), printed as one sheet
     if (path === "host/batch" && M === "POST") {
       const nb = Math.min(20, Math.max(1, +body.boxes || 1)), nq = Math.min(30, Math.max(1, +body.bags || 1)), shelf = String(body.shelf || "").trim().toUpperCase().slice(0, 24), made = [];
+      const wg = body.weight_g === undefined || body.weight_g === "" || body.weight_g === null ? null : +body.weight_g; if (wg !== null && !(wg > 0 && wg < 1e6)) return E2("batch weight (g) looks wrong");
+      let sizeId = null; if (body.bag_size_id) { const z = await hs.get("bag_sizes", { id: +body.bag_size_id }); if (!z) return E2("no such bag size"); sizeId = z.id; }
+      let sorterId = null; if (body.sorter) { const su = await hs.get("users", { username: String(body.sorter).trim().toLowerCase() }); if (!su) return E2("no such sorter on this host"); sorterId = su.id; }
       let n = (await hs.count("boxes")).n + 1;
       for (let k = 0; k < nb; k++) { let bc; do { bc = `BX${String(host.id).padStart(2, "0")}${String(n++).padStart(5, "0")}`; } while (await hs.get("boxes", { barcode: bc }));
-        const id = await hs.nextId("box"); await hs.put("boxes", { id, barcode: bc, shelf, created: now() });
+        const id = await hs.nextId("box"); await hs.put("boxes", { id, barcode: bc, shelf, created: now(), batch_weight_g: wg, sorter_id: sorterId, bag_size_id: sizeId });
         const ids = await hs.nextIds("bag", nq), st = [];
         for (let q = 0; q < nq; q++) { let code; do { code = "PTS-" + rnd(4).toUpperCase(); } while (await R.qr(code));
           st.push(hs.putStmt("qrcodes", { code, session_id: null, user_id: null, created: now(), expires: Date.now() + PREP_TTL, status: "issued" }),
@@ -444,8 +506,9 @@ export async function onRequest(ctx) {
       await hs.staleTotals(); return J2({ ok: true, boxes: made });
     }
     if (path === "host/batch") {
-      const bx = await hs.list("boxes", {}, "id desc", 60), bags = bx.length ? await hs.list("bags", { box_id: bx.map(x => x.id), status: { ne: "void" } }, "id") : [];
-      return J2({ boxes: bx.map(x => { const bs = bags.filter(b => b.box_id === x.id); return { ...x, nbags: bs.length, session_id: bs.find(b => b.session_id)?.session_id || null }; }) });
+      const un = new Map((await hs.list("users", {})).map(u => [u.id, u.username]));
+      const bx = (await hs.list("boxes", {}, "id desc", 60)).map(x => ({ ...x, sorter: un.get(x.sorter_id) || null })), bags = bx.length ? await hs.list("bags", { box_id: bx.map(x => x.id), status: { ne: "void" } }, "id") : [];
+      return J2({ boxes: bx.map(x => { const bs = bags.filter(b => b.box_id === x.id); return { ...x, nbags: bs.length, session_id: bs.find(b => b.session_id)?.session_id || null }; }), sorters: [...un.values()], bag_sizes: await hs.list("bag_sizes", {}, "id") });
     }
     if ((m = path.match(/^host\/sheet\/(\d+)$/))) {
       const box = await hs.get("boxes", { id: +m[1] }); if (!box) return E2("not found", 404);
