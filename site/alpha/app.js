@@ -35,12 +35,30 @@ const qrURL = code => { const q = qrcode(0, "M"); q.addData(code); q.make(); ret
 const barSVG = code => { const s = document.createElementNS("http://www.w3.org/2000/svg", "svg"); JsBarcode(s, code, { format: "CODE128", height: 60, fontSize: 14, margin: 4 }); return s.outerHTML; };
 const pill = (t, cls) => `<span class="pill ${esc(cls || t)}">${esc(t)}</span>`;
 
-// ---------------- scanning (BarcodeDetector where available)
-function attachScan(btn, vid, onCode) { if (!("BarcodeDetector" in window) || !navigator.mediaDevices) return; btn.hidden = false; let stream = null, last = "";
-  btn.onclick = async () => { if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; vid.hidden = true; return; }
-    const det = new BarcodeDetector({ formats: ["qr_code", "code_128"] }); stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-    vid.srcObject = stream; vid.hidden = false; await vid.play();
-    const tick = async () => { if (!stream) return; try { const r = await det.detect(vid); if (r.length && r[0].rawValue !== last) { last = r[0].rawValue; onCode(last); setTimeout(() => last = "", 2500); } } catch (e) {} requestAnimationFrame(tick); }; tick(); }; }
+// ---------------- scanning: camera QR for box, bag and lookup fields
+// BarcodeDetector where the browser has it (Android Chrome); everywhere else (iPhone Safari, desktop) jsQR, vendored and loaded on first use.
+// Needs HTTPS + a tap (user gesture) for the camera; errors are shown instead of failing silently.
+let JSQR = null; const loadJsQR = () => JSQR || (JSQR = new Promise((ok, no) => { if (window.jsQR) return ok(window.jsQR); const s = document.createElement("script"); s.src = "/alpha/vendor/jsQR.js?v=1"; s.onload = () => ok(window.jsQR); s.onerror = () => { JSQR = null; no(new Error("QR reader failed to load")); }; document.head.appendChild(s); }));
+async function qrDecoder() {
+  if ("BarcodeDetector" in window) try { const f = await BarcodeDetector.getSupportedFormats(); if (f.includes("qr_code")) { const d = new BarcodeDetector({ formats: f.filter(x => ["qr_code", "code_128"].includes(x)) }); return async v => (await d.detect(v))[0]?.rawValue || null; } } catch (e) {}
+  const jsQR = await loadJsQR(), c = document.createElement("canvas"), g = c.getContext("2d", { willReadFrequently: true });
+  return async v => { const w = v.videoWidth, h = v.videoHeight; if (!w || !h) return null; const k = Math.min(1, 720 / Math.max(w, h)); c.width = Math.round(w * k); c.height = Math.round(h * k);
+    g.drawImage(v, 0, 0, c.width, c.height); const r = jsQR(g.getImageData(0, 0, c.width, c.height).data, c.width, c.height, { inversionAttempts: "dontInvert" }); return r?.data || null; };
+}
+const camErr = e => e?.name === "NotAllowedError" ? "Camera blocked: allow camera access for this site (Settings › Safari › Camera on iPhone), or type the code." : e?.name === "NotFoundError" ? "No camera found: type the code instead." : e?.name === "NotReadableError" ? "The camera is busy in another app." : (e?.message || "Camera failed") + ": type the code instead.";
+let SCAN_STOP = null;   // one camera at a time; re-rendered screens stop the old stream
+function attachScan(btn, vid, onCode) { if (!btn || !vid) return;
+  if (!navigator.mediaDevices?.getUserMedia || !window.isSecureContext) return;   // no camera API (or plain http): typing still works
+  btn.hidden = false; vid.setAttribute("playsinline", ""); vid.setAttribute("webkit-playsinline", ""); vid.muted = true; let stream = null, last = "", busy = false;
+  const stop = () => { if (stream) stream.getTracks().forEach(t => t.stop()); stream = null; vid.srcObject = null; vid.hidden = true; btn.textContent = "📷 Scan"; if (SCAN_STOP === stop) SCAN_STOP = null; };
+  btn.onclick = async () => { if (stream || busy) return stop(); busy = true; SCAN_STOP?.();
+    try { const decP = qrDecoder();   // load the decoder while the camera starts
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+      SCAN_STOP = stop; vid.srcObject = stream; vid.hidden = false; btn.textContent = "✕ Stop"; await vid.play(); const dec = await decP;
+      const tick = async () => { if (!stream) return; if (!vid.isConnected) return stop();
+        try { const v = await dec(vid); if (v && v !== last) { last = v; setTimeout(() => last = "", 2500); navigator.vibrate?.(60); onCode(v); } } catch (e) {}
+        setTimeout(tick, 120); }; tick();
+    } catch (e) { stop(); toast(camErr(e), 5000); } finally { busy = false; } }; }
 
 // ---------------- views
 const CS_HTML = `<dialog id="cs" class="sheet"><div class="card"><div class="cshead"><h3>Color for <span id="cs_part" class="mono"></span></h3><button type="button" class="btn ghost small" id="cs_x">✕</button></div>
