@@ -22,20 +22,30 @@ async function hmac(secret, msg) {
   const k = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   return hex(await crypto.subtle.sign("HMAC", k, enc.encode(msg)));
 }
-async function readCookie(req, secret) { // value: "<host>:<user>.<exp>.<sig>"
+async function readCookie(req, secret, kv) { // value: "<host>:<user>:<ver>.<exp>.<sig>" (older "<host>:<user>" = ver 0); kv: signed-out tokens
   const m = (req.headers.get("cookie") || "").match(/ptsa=([^;]+)/);
-  if (!m) return null;
+  if (!m || !m[1]) return { why: "none" };
   const [who, exp, sig] = decodeURIComponent(m[1]).split(".");
-  if (!sig || +exp < Date.now() || (await hmac(secret, who + "." + exp)) !== sig) return null;
-  const [hid, uid] = who.split(":").map(Number);
-  return Number.isInteger(hid) && Number.isInteger(uid) ? { hid, uid } : null;
+  if (!sig || (await hmac(secret, who + "." + exp)) !== sig) return { why: "invalid" };
+  if (+exp < Date.now()) return { why: "expired" };
+  if (kv && (await kv.get("out:" + sig))) return { why: "signed_out" };
+  const [hid, uid, ver] = who.split(":").map(Number);
+  return Number.isInteger(hid) && Number.isInteger(uid) ? { hid, uid, ver: ver || 0 } : { why: "invalid" };
 }
+const SIGNIN_DAYS = 14, LOCK_AFTER = 5, LOCK_MIN = 15;
+async function signinCookie(secret, u) { const exp = Date.now() + SIGNIN_DAYS * 864e5, v = `${u.host_id}:${u.id}:${+u.token_ver || 0}.${exp}`;
+  return { "set-cookie": `ptsa=${encodeURIComponent(v + "." + (await hmac(secret, v)))}; Path=/alpha; HttpOnly; Secure; SameSite=Lax; Max-Age=${SIGNIN_DAYS * 86400}` }; }
+const CLEAR = { "set-cookie": "ptsa=; Path=/alpha; Max-Age=0; HttpOnly; Secure; SameSite=Lax" };
+const WHY = { expired: "Your sign-in expired. Please sign in again.", signed_out: "You were signed out. Please sign in again.", disabled: "This account is turned off. Ask your host." };
 let PALETTE = null, MIGRATED = false, SECRET = null;
 const BAGS_MIGRATED = new Set();
 const colorName = id => ((PALETTE || {})[id] || [String(id)])[0];
 const cardIn = c => (c ? { ...c, alts: JSON.parse(c.alts || "[]"), color_guesses: JSON.parse(c.color_guesses || "[]"), crop: c.image_id ? `/alpha/api/crop/${c.image_id}` : null } : null);
 const CARD_COLS = ["id", "session_id", "part", "name", "color", "qty", "confidence", "alts", "color_guesses", "image_id", "status", "bag_code"];
 const cardRow = c => Object.fromEntries(CARD_COLS.filter(k => k in c).map(k => [k, c[k]]));
+const sessHours = s => Math.max(0, ((s.ended ? Date.parse(s.ended + "Z") : Date.now()) - Date.parse(s.started + "Z")) / 36e5);
+const payAmt = (s, host) => host.pay_mode === "hr" ? sessHours(s) * host.rate_hr : s.weight_lb ? s.weight_lb * host.rate_lb : 0;   // $ for one session (0 while the sorted weight is not entered)
+const csvCell = v => { const t = v === null || v === undefined ? "" : String(v); return /[",\n\r]/.test(t) || /^[=+\-@]/.test(t) ? `"${(/^[=+\-@]/.test(t) ? "'" : "") + t.replace(/"/g, '""')}"` : t; };
 function pay(s, host) {
   if (host.pay_mode === "hr") { const h = ((s.ended ? Date.parse(s.ended + "Z") : Date.now()) - Date.parse(s.started + "Z")) / 36e5; return `$${(h * host.rate_hr).toFixed(2)} (${h.toFixed(2)} h × $${host.rate_hr.toFixed(2)})`; }
   return s.weight_lb ? `$${(s.weight_lb * host.rate_lb).toFixed(2)} (${s.weight_lb} lb × $${host.rate_lb.toFixed(2)})` : "sorted weight not entered";
@@ -168,7 +178,7 @@ export async function onRequest(ctx) {
   const MET = req.headers.get("x-pts-meter") === "1" ? meter(env.PTSDB) : null;
   const D1 = MET || env.PTSDB, sh = sharedStore(D1);
   const J2 = (o, s = 200, h = {}) => J(o, s, MET ? { ...h, "x-pts-rows-read": String(MET.m.rows_read), "x-pts-rows-written": String(MET.m.rows_written), "x-pts-queries": String(MET.m.q) } : h);
-  const E2 = (m, s = 400, x = {}) => J2({ error: m, ...x }, s);
+  const E2 = (m, s = 400, x = {}, h = {}) => J2({ error: m, ...x }, s, h);
   if (!MIGRATED) { await migrateFromKV({ ...env, PTSDB: D1 }); await ensureIndexes(D1); MIGRATED = true; }
   if (!SECRET) SECRET = await sh.meta("secret");
   const secret = SECRET;
@@ -177,10 +187,17 @@ export async function onRequest(ctx) {
   if (path === "login" && M === "POST") {
     const un = String(body.username || "").trim().toLowerCase();
     const u = await findLogin(D1, un);
-    if (!u || !(await checkPw(String(body.password || ""), u.pw_hash))) return E2("Wrong username or password.", 401);
-    const exp = Date.now() + 14 * 864e5, v = `${u.host_id}:${u.id}.${exp}`;
-    return J2({ ok: true }, 200, { "set-cookie": `ptsa=${encodeURIComponent(v + "." + (await hmac(secret, v)))}; Path=/alpha; HttpOnly; Secure; SameSite=Lax; Max-Age=1209600` });
+    if (u && u.locked_until && Date.parse(u.locked_until + "Z") > Date.now()) return E2(`Too many wrong passwords. Try again in ${LOCK_MIN} minutes, or ask your host to reset your password.`, 429, { reason: "locked" });
+    if (!u || !(await checkPw(String(body.password || ""), u.pw_hash))) {
+      if (u) { const n = (+u.failed_logins || 0) + 1, lock = n >= LOCK_AFTER; const uh = hostStore(D1, u.host_id);
+        await uh.update("users", { id: u.id }, { failed_logins: lock ? 0 : n, locked_until: lock ? new Date(Date.now() + LOCK_MIN * 6e4).toISOString().replace("T", " ").slice(0, 19) : u.locked_until || null });
+        if (lock) { await uh.put("audit", { id: await uh.nextId("audit"), at: now(), user_id: u.id, username: un, action: "sign-in locked", target: un, detail: `${LOCK_AFTER} wrong passwords; locked ${LOCK_MIN} min` }); return E2(`Too many wrong passwords. Try again in ${LOCK_MIN} minutes, or ask your host to reset your password.`, 429, { reason: "locked" }); } }
+      return E2("Wrong username or password.", 401); }
+    if (u.status === "disabled") return E2(WHY.disabled, 403, { reason: "disabled" });
+    if (+u.failed_logins || u.locked_until) await hostStore(D1, u.host_id).update("users", { id: u.id }, { failed_logins: 0, locked_until: null });
+    return J2({ ok: true }, 200, await signinCookie(secret, u));
   }
+
   // training-data export for the offline dataset script (EXPORT_KEY header; no cookie)
   if (path.startsWith("train/export") || path.startsWith("train/img/")) {
     if (!env.EXPORT_KEY || req.headers.get("x-export-key") !== env.EXPORT_KEY) return E2("forbidden", 403);
@@ -189,10 +206,13 @@ export async function onRequest(ctx) {
     const v = await ts.image(path.slice(10)); if (!v) return E2("nf", 404);
     return new Response(Uint8Array.from(atob(v), c => c.charCodeAt(0)), { headers: { "content-type": "image/jpeg", "x-robots-tag": "noindex" } });
   }
-  if (path === "logout") return J2({ ok: true }, 200, { "set-cookie": "ptsa=; Path=/alpha; Max-Age=0; HttpOnly; Secure; SameSite=Lax" });
+  if (path === "logout") {   // end this token server-side (KV entry until it would have expired), then clear the cookie
+    const m = (req.headers.get("cookie") || "").match(/ptsa=([^;]+)/), [, exp, sig] = m ? decodeURIComponent(m[1]).split(".") : [];
+    if (sig && env.PTSA && +exp > Date.now() && (await readCookie(req, secret)).uid) await env.PTSA.put("out:" + sig, "1", { expirationTtl: Math.max(60, Math.ceil((+exp - Date.now()) / 1000)) });
+    return J2({ ok: true }, 200, { "set-cookie": "ptsa=; Path=/alpha; Max-Age=0; HttpOnly; Secure; SameSite=Lax" }); }
 
-  const ck = await readCookie(req, secret);
-  if (!ck) return E2("login required", 401);
+  const ck = await readCookie(req, secret, env.PTSA);
+  if (!ck.uid) return E2(WHY[ck.why] || "login required", 401, { reason: ck.why });
   // only the logged-in user's host, through the gatekeeper; each endpoint below reads just the rows it needs
   const hs = hostStore(D1, ck.hid), R = repo(hs);
   const user = await hs.get("users", { id: ck.uid });
@@ -203,10 +223,13 @@ export async function onRequest(ctx) {
     const z = (box?.bag_size_id && sizes.find(x => x.id === box.bag_size_id)) || sizes[0] || null, su = s && s.user_id !== user.id ? await hs.get("users", { id: s.user_id }) : user;
     return SZ[k] = { max_g: z ? +z.max_g : +host.bag_max_g || 0, max_cm3: z ? +z.max_cm3 : +host.bag_max_cm3 || 0, size: z ? z.name : null, share: +su?.pay_share || 0 }; };
   if (!user) return E2("login required", 401);
+  if ((+user.token_ver || 0) !== ck.ver) return E2(WHY.signed_out, 401, { reason: "signed_out" }, CLEAR);
+  if (user.status === "disabled") return E2(WHY.disabled, 401, { reason: "disabled" });
   const host = await hs.get("hosts", {});
   if (!host) return E2("login required", 401);
   if (!PALETTE) PALETTE = Object.fromEntries((await sh.colors()).map(c => [c.id, [c.name]]));
-  const admin = user.role === "admin";
+  const admin = user.role === "admin", prep = !admin && +user.prep_only === 1;   // prep helper: a sorter who may also do batch prep, box/bag labels and bag lookup
+  const audit = async (action, target, detail) => { try { await hs.put("audit", { id: await hs.nextId("audit"), at: now(), user_id: user.id, username: user.username, action, target: target == null ? null : String(target).slice(0, 80), detail: detail == null ? null : String(detail).slice(0, 300) }); } catch (e) { console.warn("audit", e); } };
   const mine = s => s && s.host_id === host.id && (admin || s.user_id === user.id);
   const sess = id => hs.get("sessions", { id: String(id) });
   let m;
@@ -214,10 +237,37 @@ export async function onRequest(ctx) {
   const light = path === "identify" || path === "train/sample" || path === "train/cards" || /^crop\//.test(path) || path === "mold-exceptions" || path === "parts/info";
   if (!light) { await migrateBags(hs, sh); await R.expire(); }
 
+  // ---- own account: change password (signs out other phones), log out everywhere
+  if (path === "account/password" && M === "POST") {
+    const cur = String(body.current || ""), nw = String(body.password || "");
+    if (!(await checkPw(cur, user.pw_hash))) return E2("Your current password is not right.", 400);
+    if (nw.length < 8) return E2("New password: 8 or more characters.");
+    if (nw === cur) return E2("Pick a new password that is different from the current one.");
+    user.pw_hash = await hashPw(nw); user.pw_changed = now(); user.token_ver = (+user.token_ver || 0) + 1;
+    await hs.update("users", { id: user.id }, { pw_hash: user.pw_hash, pw_changed: user.pw_changed, token_ver: user.token_ver, failed_logins: 0, locked_until: null });
+    await audit("password changed", user.username, "by the user; other phones signed out");
+    return J2({ ok: true, msg: "Password changed. Other phones were signed out." }, 200, await signinCookie(secret, { ...user, host_id: host.id }));
+  }
+  if (path === "account/logout-all" && M === "POST") {
+    await hs.update("users", { id: user.id }, { token_ver: (+user.token_ver || 0) + 1 }); await audit("logged out everywhere", user.username);
+    return J2({ ok: true }, 200, CLEAR);
+  }
+  // ---- own pay totals by week (Mon-Sun) and month, Central time; only the signed-in user's own sessions
+  if (path === "me/pay") {
+    const ss = await hs.list("sessions", { user_id: user.id }, "started desc", 500);
+    const ct = t => new Date(new Date(Date.parse(t + "Z")).toLocaleString("en-US", { timeZone: "America/Chicago" }));
+    const wk = d => { const x = new Date(d); x.setDate(x.getDate() - ((x.getDay() + 6) % 7)); return x.toISOString().slice(0, 10); };
+    const W = new Map(), Mo = new Map();
+    for (const s of ss) { if (!s.started) continue; const d = ct(s.started), a = payAmt(s, host), lb = +s.weight_lb || 0, h = sessHours(s);
+      for (const [map, k] of [[W, wk(d)], [Mo, `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`]]) { const o = map.get(k) || { k, sessions: 0, pay: 0, lb: 0, hours: 0, missing_weight: 0 };
+        o.sessions++; o.pay += a; o.lb += lb; o.hours += h; if (host.pay_mode !== "hr" && !s.weight_lb) o.missing_weight++; map.set(k, o); } }
+    const r2 = o => ({ ...o, pay: Math.round(o.pay * 100) / 100, lb: Math.round(o.lb * 100) / 100, hours: Math.round(o.hours * 100) / 100 });
+    return J2({ pay_mode: host.pay_mode, rate: host.pay_mode === "hr" ? host.rate_hr : host.rate_lb, weeks: [...W.values()].slice(0, 12).map(r2), months: [...Mo.values()].slice(0, 12).map(r2) });
+  }
   if (path === "me") {
     const ss = await hs.list("sessions", { user_id: user.id }, "started desc", 10);
     const per = new Map((await hs.group("bags", "session_id", { session_id: ss.map(s => s.id), status: { ne: "void" } }, "qty")).map(r => [r.k, r]));
-    const out = { user: { id: user.id, username: user.username, display: user.display, role: user.role }, host,
+    const out = { user: { id: user.id, username: user.username, display: user.display, role: user.role, prep: prep, pw_changed: user.pw_changed || null }, host,
       sessions: ss.map(s => ({ ...s, nb: per.get(s.id)?.n || 0, pcs: per.get(s.id)?.s || 0 })) };
     if (url.searchParams.get("stats") === "1") out.stats = await hs.totals();   // repository totals: home screen only
     return J2(out);
@@ -326,7 +376,7 @@ export async function onRequest(ctx) {
   if (path === "host/train" || path === "host/train/delete") {
     if (!admin) return E2("host admins only", 403);
     const ts = trainStore(D1, env.PTSA);
-    if (path === "host/train/delete" && M === "POST") { const n = Array.isArray(body.ids) ? await ts.deleteIds(host.id, body.ids) : await ts.deleteHost(host.id); return J2({ ok: true, deleted: n, ...(await ts.stats(host.id)) }); }
+    if (path === "host/train/delete" && M === "POST") { const n = Array.isArray(body.ids) ? await ts.deleteIds(host.id, body.ids) : await ts.deleteHost(host.id); await audit("training photos deleted", `${n}`); return J2({ ok: true, deleted: n, ...(await ts.stats(host.id)) }); }
     return J2(await ts.stats(host.id));
   }
   if ((m = path.match(/^bag\/([\w-]+)$/)) && M === "GET") {
@@ -423,7 +473,7 @@ export async function onRequest(ctx) {
     if (M === "POST") {
       if (body.action === "shelf") { box.shelf = String(body.shelf || "").trim().toUpperCase().slice(0, 24); await hs.put("boxes", box); await hs.update("bags", { box_id: box.id }, { location: box.shelf }); msg = "Shelf address saved."; }
       if (body.action === "add") return E2("bags are added to boxes in Batch prep", 400);
-      if (body.action === "reopen") { if (!box.closed_at) return E2("this box is not closed", 409); box.closed_at = null; await hs.update("boxes", { id: box.id }, { closed_at: null }); msg = `Box ${box.barcode} reopened: bag numbers continue.`; }   // anyone on the host (sorter or admin)
+      if (body.action === "reopen") { if (!box.closed_at) return E2("this box is not closed", 409); box.closed_at = null; await hs.update("boxes", { id: box.id }, { closed_at: null }); msg = `Box ${box.barcode} reopened: bag numbers continue.`; await audit("box reopened", box.barcode); }   // anyone on the host (sorter or admin)
       if (body.action === "remove") { const b = await R.bag(body.code); if (b && b.box_id === box.id) await hs.update("bags", { id: b.id }, { box_id: null }); }
     }
     return J2({ box, msg, bags: await R.bagsOut(await hs.list("bags", { box_id: box.id, status: { ne: "void" } }, "id")),
@@ -473,12 +523,13 @@ export async function onRequest(ctx) {
     let colorsAdded = 0;
     for (const [id, name] of v.colors) if (!PALETTE[id]) { st.push(D1.prepare("insert or ignore into colors(id, name) values(?,?)").bind(id, name)); PALETTE[id] = [name]; colorsAdded++; }
     for (let i = 0; i < st.length; i += 50) await D1.batch(st.slice(i, i + 50));
-    return J2({ ok: true, added, updated, unchanged: same, colors_added: colorsAdded, errors: v.errors, n_errors: v.n_errors }); }
+    await audit("parts file imported", `${added} added, ${updated} updated`); return J2({ ok: true, added, updated, unchanged: same, colors_added: colorsAdded, errors: v.errors, n_errors: v.n_errors }); }
   if (path.startsWith("host")) {
-    if (!admin) return E2("host admins only", 403);
+    const prepOK = prep && (/^host\/(batch|bag-labels|bag-sizes)$/.test(path) || /^host\/(sheet|bag)\//.test(path)) && !(path === "host/bag-sizes" && M === "POST");
+    if (!admin && !prepOK) return E2("host admins only", 403);
     if (path === "host") { const us = await hs.list("users", {}, "id"), ns = new Map((await hs.group("sessions", "user_id")).map(r => [r.k, r.n]));
       const ss = await hs.list("sessions", {}, "started desc", 30), un = new Map(us.map(u => [u.id, u.username]));
-      return J2({ host, users: us.map(u => ({ username: u.username, display: u.display, role: u.role, ns: ns.get(u.id) || 0, pay_share: +u.pay_share || 0 })), bag_sizes: await hs.list("bag_sizes", {}, "id"), sessions: ss.map(s => ({ ...s, username: un.get(s.user_id), pay: pay(s, host) })) }); }
+      return J2({ host, users: us.map(u => ({ username: u.username, display: u.display, role: u.role, prep: +u.prep_only === 1, status: u.status || "active", locked: !!(u.locked_until && Date.parse(u.locked_until + "Z") > Date.now()), me: u.id === user.id, ns: ns.get(u.id) || 0, pay_share: +u.pay_share || 0 })), bag_sizes: await hs.list("bag_sizes", {}, "id"), sessions: ss.map(s => ({ ...s, username: un.get(s.user_id), pay: pay(s, host) })) }); }
     // delete whole sessions (cards, bags, QR codes, crops) and boxes, e.g. data made by automated test runs.
     // {sessions: [...], boxes: [...], dry: true} returns the rows (with crops when backup: true) without deleting anything.
     if (path === "host/purge" && M === "POST") {
@@ -499,25 +550,63 @@ export async function onRequest(ctx) {
       for (const b of inBox) st.push(hs.updateStmt("bags", { id: b.id }, { box_id: null }));
       for (let i = 0; i < boxes.length; i += 80) st.push(hs.delStmt("boxes", { id: boxes.slice(i, i + 80).map(x => x.id) }));
       st.push(...sh.deleteImagesStmts(imgIds));
-      await hs.batch(st); if (ok.length || boxes.length) await hs.staleTotals();
+      await hs.batch(st); if (ok.length || boxes.length) await hs.staleTotals(); await audit("purged", `${ok.length} sessions, ${boxes.length} boxes`, ok.slice(0, 10).join(" "));
       return J2({ ok: true, deleted: Object.fromEntries(Object.entries(rows).map(([k, v]) => [k, v.length])) });
+    }
+    // people: role, password reset, off/on, end sign-ins (kill switch), remove (only without sessions)
+    if (path === "host/user" && M === "POST") {
+      const u = await hs.get("users", { username: String(body.username || "").trim().toLowerCase() }); if (!u) return E2("no such user", 404);
+      const self = u.id === user.id, a = String(body.action || ""), bump = () => (+u.token_ver || 0) + 1;
+      if (a === "role") { const r = body.role === "admin" ? "admin" : "sorter", pf = body.role === "prep" ? 1 : 0;
+        if (self && r !== "admin") return E2("You can't remove your own admin role. Ask another admin.", 409);
+        await hs.update("users", { id: u.id }, { role: r, prep_only: pf }); const lbl = r === "admin" ? "admin" : pf ? "prep helper" : "sorter";
+        await audit("role set", u.username, lbl); return J2({ ok: true, msg: `${u.username} is now ${lbl === "admin" ? "an admin" : `a ${lbl}`}.` }); }
+      if (a === "reset") { const pw = String(body.password || ""); if (pw.length < 8) return E2("Temporary password: 8 or more characters.");
+        await hs.update("users", { id: u.id }, { pw_hash: await hashPw(pw), pw_changed: now(), token_ver: bump(), failed_logins: 0, locked_until: null });
+        await audit("password reset", u.username, "temporary password set by admin; signed out everywhere"); return J2({ ok: true, msg: `New password set for ${u.username}. Tell them in person; they can change it under Account.` }); }
+      if (a === "disable" || a === "enable") { if (self) return E2("You can't turn off your own account.", 409);
+        await hs.update("users", a === "disable" ? { id: u.id } : { id: u.id }, a === "disable" ? { status: "disabled", token_ver: bump() } : { status: "active", failed_logins: 0, locked_until: null });
+        await audit(a === "disable" ? "account turned off" : "account turned on", u.username, a === "disable" ? "signed out everywhere" : null);
+        return J2({ ok: true, msg: a === "disable" ? `${u.username} is turned off and signed out everywhere.` : `${u.username} can sign in again.` }); }
+      if (a === "kill") { await hs.update("users", { id: u.id }, { token_ver: bump() }); await audit("signed out everywhere", u.username, "by admin");
+        return J2({ ok: true, msg: `${u.username} is signed out on every phone.` }); }
+      if (a === "remove") { if (self) return E2("You can't remove yourself.", 409);
+        const n = (await hs.list("sessions", { user_id: u.id }, "", 1)).length; if (n) return E2(`${u.username} has sorting sessions, so the account is kept for pay records. Turn it off instead.`, 409);
+        await hs.del("users", { id: u.id }); await audit("user removed", u.username); return J2({ ok: true, msg: `${u.username} removed.` }); }
+      return E2("unknown action");
+    }
+    if (path === "host/audit" && M === "GET") return J2({ entries: await hs.list("audit", {}, "id desc", 300) });
+    // sessions and pay as CSV (host admins only; times in Central time)
+    if (path === "host/pay.csv" && M === "GET") {
+      const ss = await hs.list("sessions", {}, "started desc", 5000), us = new Map((await hs.list("users", {}, "id")).map(u => [u.id, u]));
+      const per = new Map(); for (let i = 0; i < ss.length; i += 80) for (const r of await hs.group("bags", "session_id", { session_id: ss.slice(i, i + 80).map(s => s.id), status: { ne: "void" } }, "qty")) per.set(r.k, r);
+      const ct = t => t ? new Date(Date.parse(t + "Z")).toLocaleString("en-US", { timeZone: "America/Chicago", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).replace(",", "") : "";
+      const rows = [["session", "sorter", "started (CT)", "ended (CT)", "status", "bags", "pieces", "sorted weight (lb)", "hours", "pay basis", "pay ($)"]];
+      for (const s of ss) rows.push([s.id, us.get(s.user_id)?.username || "", ct(s.started), ct(s.ended), s.status, per.get(s.id)?.n || 0, per.get(s.id)?.s || 0, s.weight_lb ?? "", sessHours(s).toFixed(2),
+        host.pay_mode === "hr" ? `$${host.rate_hr.toFixed(2)}/h` : `$${host.rate_lb.toFixed(2)}/lb`, host.pay_mode !== "hr" && !s.weight_lb ? "" : payAmt(s, host).toFixed(2)]);
+      await audit("pay CSV downloaded", `${ss.length} sessions`);
+      return new Response(rows.map(r => r.map(csvCell).join(",")).join("\r\n") + "\r\n", { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename="paidtosort-sessions-pay.csv"`, "x-robots-tag": "noindex, nofollow", "cache-control": "no-store" } });
     }
     if (path === "host/settings" && M === "POST") {
       Object.assign(host, { site_name: String(body.site_name || host.site_name).slice(0, 80), pay_mode: body.pay_mode === "hr" ? "hr" : "lb", rate_lb: +body.rate_lb || 1.35, rate_hr: +body.rate_hr || 10, low_threshold: Math.max(1, +body.low_threshold || 3),
         payout_share: Math.min(1, Math.max(0, +body.payout_share || 0)), bag_max_g: Math.max(0, +(body.bag_max_g ?? host.bag_max_g ?? 110) || 0), bag_max_cm3: Math.max(0, +(body.bag_max_cm3 ?? host.bag_max_cm3) || 0),
         loose_density: Math.min(2, Math.max(0.05, +body.loose_density || host.loose_density || 0.4)) });
-      await hs.put("hosts", host); return J2({ ok: true, msg: "Settings saved." });
+      if (body.contact_note !== undefined) host.contact_note = String(body.contact_note || "").trim().slice(0, 300);
+      await hs.put("hosts", host); await audit("settings saved", host.site_name, `pay ${host.pay_mode === "hr" ? `$${host.rate_hr}/h` : `$${host.rate_lb}/lb`}, default share ${host.payout_share}`); return J2({ ok: true, msg: "Settings saved." });
     }
     if (path === "host/sorter" && M === "POST") {
       const un = String(body.username || "").trim().toLowerCase();
       if (!/^[a-z0-9_.-]{3,32}$/.test(un) || String(body.password || "").length < 8) return E2("Username 3-32 letters/numbers; password 8+ characters.");
       if (await findLogin(D1, un)) return E2("That username is taken.");
-      await hs.put("users", { id: await hs.nextId("user"), username: un, pw_hash: await hashPw(body.password), role: "sorter", display: String(body.display || un).slice(0, 60), created: now(), pay_share: Math.min(1, Math.max(0, +host.payout_share || 0)) });
-      return J2({ ok: true, msg: `Sorter ${un} added.` });
+      // the id sequence can lag behind users created outside it (seeded / imported): never reuse an id, that would overwrite an existing person
+      let uid = await hs.nextId("user"); const top = Math.max(0, ...(await hs.list("users", {}, "id")).map(x => +x.id || 0));
+      if (uid <= top) { uid = top + 1; await D1.prepare("update host_seq set v = ? where host_id = ? and name = 'user'").bind(uid, host.id).run(); }
+      await hs.put("users", { id: uid, username: un, pw_hash: await hashPw(body.password), role: "sorter", display: String(body.display || un).slice(0, 60), created: now(), pay_share: Math.min(1, Math.max(0, +host.payout_share || 0)) });
+      await audit("sorter added", un); return J2({ ok: true, msg: `Sorter ${un} added.` });
     }
     // per-sorter pay: share of the parts value shown to that sorter as estimated earnings (0 = show the parts value only)
     if (path === "host/sorter/pay" && M === "POST") { const u = await hs.get("users", { username: String(body.username || "").trim().toLowerCase() }); if (!u) return E2("no such user", 404);
-      u.pay_share = Math.min(1, Math.max(0, +body.pay_share || 0)); await hs.put("users", u); return J2({ ok: true, username: u.username, pay_share: u.pay_share }); }
+      const was = +u.pay_share || 0; u.pay_share = Math.min(1, Math.max(0, +body.pay_share || 0)); await hs.put("users", u); await audit("pay share set", u.username, `${Math.round(was * 100)}% -> ${Math.round(u.pay_share * 100)}%`); return J2({ ok: true, username: u.username, pay_share: u.pay_share }); }
     // bag sizes (host list): add / edit / remove. A size in use by a box can be edited but not removed.
     if (path === "host/bag-sizes" && M === "GET") return J2({ sizes: await hs.list("bag_sizes", {}, "id") });
     if (path === "host/bag-sizes" && M === "POST") { const sizes = await hs.list("bag_sizes", {}, "id"), name = String(body.name || "").trim().slice(0, 40);
@@ -538,7 +627,7 @@ export async function onRequest(ctx) {
         st.push(hs.putStmt("qrcodes", { code, session_id: null, user_id: null, created: now(), expires: Date.now() + LABEL_TTL, status: "issued" }),
           hs.putStmt("bags", { id: ids[k], code, host_id: host.id, session_id: null, user_id: null, part: "", name: "", color: 0, qty: 0, box_id: null, location: "", status: "labelled", promoted_at: null, picked_at: null, created: now() })); }
       for (let i = 0; i < st.length; i += 80) await hs.batch(st.slice(i, i + 80)); await hs.staleTotals();
-      return J2({ ok: true, from: seq[0], to: seq[n - 1], labels: codes });
+      await audit("bag labels made", `${codes[0]} to ${codes[codes.length - 1]}`, `${n} labels`); return J2({ ok: true, from: seq[0], to: seq[n - 1], labels: codes });
     }
     if (path === "host/bag-labels" && M === "GET") {   // reprint a range (?from=1&to=40) or list the free supply
       const f = Math.floor(+url.searchParams.get("from")), t = Math.floor(+url.searchParams.get("to"));
@@ -554,7 +643,7 @@ export async function onRequest(ctx) {
         if (!["missing", "moved", "clear"].includes(a)) return E2("action: missing, moved or clear");
         const note = String(body.note || "").trim().slice(0, 120); if (a === "moved" && !note) return E2("where is it now? add a note");
         Object.assign(b, a === "clear" ? { trace: null, trace_note: null, trace_at: null } : { trace: a, trace_note: note || null, trace_at: now() });
-        await hs.update("bags", { id: b.id }, { trace: b.trace, trace_note: b.trace_note, trace_at: b.trace_at }); }
+        await hs.update("bags", { id: b.id }, { trace: b.trace, trace_note: b.trace_note, trace_at: b.trace_at }); await audit(a === "clear" ? "bag mark cleared" : `bag marked ${a}`, b.code, note || null); }
       const bo = await R.bagOut(b), box = b.box_id ? await hs.get("boxes", { id: b.box_id }) : null, who = b.user_id ? await hs.get("users", { id: b.user_id }) : null;
       return J2({ bag: { ...bo, sorter: who?.username || null, box: box ? { id: box.id, barcode: box.barcode, shelf: box.shelf || "", closed_at: box.closed_at || null } : null,
         state: b.trace || (b.sealed_at || b.status === "bagged" ? "sealed" : b.box_n ? "filling" : "unused") }, msg: M === "POST" ? "Saved." : null });
@@ -572,7 +661,7 @@ export async function onRequest(ctx) {
           st.push(hs.putStmt("qrcodes", { code, session_id: null, user_id: null, created: now(), expires: Date.now() + PREP_TTL, status: "issued" }),
             hs.putStmt("bags", { id: ids[q], code, host_id: host.id, session_id: null, user_id: null, part: "", name: "", color: 0, qty: 0, box_id: id, location: shelf, status: "labelled", promoted_at: null, picked_at: null, created: now() })); }
         await hs.batch(st); made.push(id); }
-      await hs.staleTotals(); return J2({ ok: true, boxes: made });
+      await hs.staleTotals(); await audit("boxes created", `${made.length} box${made.length === 1 ? "" : "es"}`, shelf || null); return J2({ ok: true, boxes: made });
     }
     if (path === "host/batch") {
       const un = new Map((await hs.list("users", {})).map(u => [u.id, u.username]));

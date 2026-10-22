@@ -5,14 +5,15 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": 
 const img = (p, c) => `https://img.bricklink.com/ItemImage/PN/${+c || 0}/${encodeURIComponent(p)}.png`;
 let ME = null, PAL = null, PALBY = {};
 let Q = Promise.resolve(); // serialize writes
+let SIGNIN_MSG = "";
 async function api(path, body, method) {
   const run = async () => { let r; try { r = await fetch("/alpha/api/" + path, { method: method || (body ? "POST" : "GET"), headers: body ? { "content-type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined, credentials: "same-origin" }); }
     catch (e) { NET.down(); return { error: "No connection: nothing was saved. Check your signal and try again.", offline: true, _status: 0 }; } NET.up();
-    const j = await r.json().catch(() => ({ error: "bad response" })); if (r.status === 401 && path !== "login") { ME = null; location.hash = "#/login"; } return Object.assign(j, { _status: r.status }); };
+    const j = await r.json().catch(() => ({ error: "bad response" })); if (r.status === 401 && path !== "login") { ME = null; SIGNIN_MSG = j.error && j.reason && j.reason !== "none" ? j.error : (localStorage.getItem("pts-in") ? "You were signed out. Please sign in again." : ""); localStorage.removeItem("pts-in"); header(); location.hash = "#/login"; } return Object.assign(j, { _status: r.status }); };
   if (body) { const b = BUSY.claim(); const p = Q.then(run); Q = p.catch(() => {}); if (b) p.finally(() => BUSY.release(b)); return p; } return run();
 }
 // network state: a banner while offline; a scan that failed offline is kept and retried once the phone is back online
-const NET = (() => { let bar = null, retry = null; const show = on => { if (on && !bar) { bar = document.createElement("div"); bar.id = "netbar"; bar.setAttribute("role", "alert"); bar.textContent = "Offline: changes are not saved until you are back online."; document.body.appendChild(bar); } else if (!on && bar) { bar.remove(); bar = null; } };
+const NET = (() => { let bar = null, retry = null; const show = on => { if (on && !bar) { bar = document.createElement("div"); bar.id = "netbar"; bar.setAttribute("role", "alert"); bar.textContent = "Offline: confirmed cards are kept on this phone and sent later; other changes need a connection."; document.body.appendChild(bar); } else if (!on && bar) { bar.remove(); bar = null; } };
   addEventListener("offline", () => show(true)); addEventListener("online", () => { show(false); const f = retry; retry = null; if (f) f(); }); if (navigator.onLine === false) setTimeout(() => show(true));
   return { down: () => show(true), up: () => { if (navigator.onLine !== false) show(false); }, retryOnline: f => { retry = f; } }; })();
 // double-submit guard: the button (or form submit button) the sorter just pressed stays disabled until its POST answers; +/- quantity steppers are exempt
@@ -86,10 +87,10 @@ const CS_HTML = `<dialog id="cs" class="sheet"><div class="card"><div class="csh
   <input id="cs_q" aria-label="Search colors" type="search" enterkeyhint="done" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Type to search colors" autocomplete="off">
   <div id="cs_body"></div><label class="small tick" style="margin-top:8px"><input type="checkbox" id="cs_all" style="width:auto;display:inline"> Show all colors</label></div></dialog>`;
 const V = {}; let FIRST = true, SESS_OPEN = false; const LASTK = () => "pts_last_sid:" + (ME?.host?.id ?? "") + ":" + (ME?.user?.username || "");   // first screen after the app (re)starts: auto-resume the last open session
-V.login = () => { main.innerHTML = `<div class="login"><img src="/alpha/pts-mark-256.png" class="bigmark" alt="Paid to Sort"><h1>Sign in</h1><p class="muted">Sort parts. Get paid.</p><p class="err" id="err"></p>
+V.login = (qs = "") => { const adm = /(^|&)admin\b/.test(qs); main.innerHTML = `<div class="login"><img src="/alpha/pts-mark-256.png" class="bigmark" alt="Paid to Sort"><h1>${adm ? "Admin sign in" : "Sign in"}</h1><p class="muted">${adm ? "Sign in with a host admin account." : "Sort parts. Get paid."}</p>${SIGNIN_MSG ? `<p class="card notice" id="why" role="status">${esc(SIGNIN_MSG)}</p>` : ""}<p class="err" id="err" role="alert"></p>
   <form class="card" id="lf"><label>Username<input name="username" autocomplete="username" autocapitalize="none" required></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button class="btn gold wide">Sign in</button></form></div>`;
   $("#lf").onsubmit = async e => { e.preventDefault(); const f = new FormData(e.target); const j = await api("login", { username: f.get("username"), password: f.get("password") });
-    if (j.ok) { await loadMe(); location.hash = "#/"; } else $("#err").textContent = j.error; }; };
+    if (j.ok) { SIGNIN_MSG = ""; localStorage.setItem("pts-in", "1"); await loadMe(); location.hash = adm && ME?.user.role === "admin" ? "#/host" : "#/"; } else $("#err").textContent = j.error; }; };
 
 V.home = async () => { const j = await api("me?stats=1"); ME = j; header();
   const h = j.host;
@@ -97,12 +98,14 @@ V.home = async () => { const j = await api("me?stats=1"); ME = j; header();
   if (op && FIRST && localStorage.getItem(LASTK()) === op.id) { FIRST = false; location.hash = "#/s/" + op.id; return; } FIRST = false;
   main.innerHTML = `<h1>Hi ${esc(j.user.display || j.user.username)}</h1>${op ? `<a class="btn gold wide big" id="resume" href="#/s/${op.id}">▶ Resume session <span class="mono">${op.id}</span></a>` : ""}<button class="btn ${op ? "" : "gold "}wide big" id="start">＋ Start a sorting session</button>
   <p class="muted small">Pay: ${h.pay_mode === "hr" ? `$${h.rate_hr.toFixed(2)} per hour` : `$${h.rate_lb.toFixed(2)} per lb sorted`}</p>
-  <h2>Recent sessions</h2>${j.sessions.map(s => `<a class="row card" href="#/s/${s.id}"><b class="mono">${s.id}</b><span class="muted small">${s.nb} bags · ${s.pcs} pcs</span>${pill(s.status)}</a>`).join("") || `<p class="muted">No sessions yet.</p>`}
+  ${!j.sessions.length ? `<div class="card firstrun"><h3>Getting started</h3><ol class="steps"><li>Get a box and a stack of labeled bags from your host.</li><li>Tap <b>Start a sorting session</b>, then scan the box’s master QR.</li><li>Scan a labeled bag and write the number the app shows on it.</li><li>Lay parts flat on a plain surface, take a photo, then confirm each card.</li><li>Bag full? Scan the next bag. Box full? Tap <b>Box full</b> and put it away.</li></ol><p class="small"><a href="#/help">Help &amp; FAQ</a> · <a href="#/help?contact">Contact your host</a></p></div>` : ""}
+  <h2>Recent sessions</h2>${j.sessions.map(s => `<a class="row card" href="#/s/${s.id}"><b class="mono">${s.id}</b><span class="muted small">${s.nb} bags · ${s.pcs} pcs</span>${pill(s.status)}</a>`).join("") || `<p class="muted">No sessions yet. Your sessions show up here.</p>`}
   <div class="stat card"><div><b>${(j.stats || {}).nb ?? (j.stats || {}).n ?? "–"}</b><span>bags sorted</span></div><div><b>${(j.stats || {}).n ?? "–"}</b><span>part lots</span></div><div><b>${(j.stats || {}).pcs ?? "–"}</b><span>pieces</span></div></div>
-  <p class="center"><a href="#/putaway" class="btn">Put-away</a> ${j.user.role === "admin" ? `<a href="#/host/settings" class="btn">Host settings</a>` : ""} <a href="#/logout" class="btn ghost">Sign out</a></p>`;
+  <p class="center"><a href="#/putaway" class="btn">Put-away</a> <a href="#/pay" class="btn">My pay</a> <a href="#/account" class="btn">Account</a> <a href="#/help" class="btn">Help</a> ${j.user.role === "admin" ? `<a href="#/host/settings" class="btn">Host settings</a>` : ""} <a href="#/logout" class="btn ghost">Log out</a></p>`;
   $("#start").onclick = async () => { const r = await api("session/start", {}); location.hash = "#/s/" + r.id; }; };
 
 V.session = async (sid) => { await palette(); const j = await api("session/" + sid); if (j.error) { main.innerHTML = `<p class="err">${esc(j.error)}</p>`; return; }
+  const oq = OQ.ids(); if (oq.size) j.cards = j.cards.filter(c => !oq.has(c.id));   // confirmed offline on this phone, waiting to be sent
   const s = j.s, open = s.status === "open"; SESS_OPEN = open; SBAGS = j.bags; SBOX = j.box; SCUR = j.cur_bag || null; METER = j.meter; OPENLOTS = j.open_lots || [];
   main.innerHTML = `<div class="sess"><div><small class="muted">Session</small><h1 class="mono">${s.id}</h1></div>${pill(s.status)}</div>
   <p class="muted small">${esc(j.owner)} · started ${esc(ctime(s.started))} · ${esc(j.pay)}</p>
@@ -114,6 +117,7 @@ V.session = async (sid) => { await palette(); const j = await api("session/" + s
    <div id="prog" class="prog" hidden><div class="spin"></div><span id="progt">Working…</span></div><canvas id="prev" class="prev" hidden></canvas><div id="review" class="review" hidden></div></div>` : ""}
   ${open && !SBOX ? "" : `<div id="openbar">${open ? openBarHTML() : ""}</div>`}
   <div id="dock" class="dock">${open && SBOX ? `<div id="openbag">${openBagHTML()}</div>` : ""}<div id="photo" hidden></div></div>
+  <div id="oqbar" class="bagfull oqbar" role="status" hidden></div>
   ${open || j.cards.length ? `<h2>Verify <span class="muted small" id="pend">${j.cards.length} to check</span></h2>
   <p class="muted small" id="verhint"${open && j.cards.length ? "" : " hidden"}>Swipe up on a card’s <b>⇡ bar</b> to confirm it (or tap ✓); scroll anywhere else. Confirmed lots go into the bag you are filling; when it is full, scan the next labeled bag.</p>
   <div id="cards">${j.cards.map(c => cardHTML(c)).join("")}</div>` : ""}
@@ -126,7 +130,7 @@ ${CS_HTML}`;
   if (open) { ["#cam", "#pick"].forEach(id => $(id).onchange = e => processPhoto(sid, e.target.files[0]));
    
     $("#endf").onsubmit = async e => { e.preventDefault(); const r = await api(`session/${sid}/end`, { weight_lb: e.target.w?.value || null }); if (!r.ok) return toast(r.error || "failed", 4000); await trainCheck(sid, true); route(); }; }
-  wireCards(j.cards); wireBags($("#bags")); wireOpenBar(); wireOpenBag(); PH.init(j.cards);
+  wireCards(j.cards); wireBags($("#bags")); wireOpenBar(); wireOpenBag(); PH.init(j.cards); OQ.bar(); if (oq.size && navigator.onLine !== false) OQ.sync(false);
   if (open) { localStorage.setItem(LASTK(), sid); resumeReview(sid); } else if (localStorage.getItem(LASTK()) === sid) localStorage.removeItem(LASTK());
   trainHooks(sid, open);
 };
@@ -302,7 +306,8 @@ const ep = el => (el.dataset.lot ? "lot/" : "card/") + el.dataset.id;
 function wireCards(cards, els) { els = els || $$(".pcard:not(.lotedit)");
   const byId = Object.fromEntries(cards.map(c => [c.id, c]));
   const left = () => { const n = $$(".pcard:not(.lotedit):not(.going):not(.dropping)").length; $("#pend").textContent = n + " to check"; if ($("#verhint")) $("#verhint").hidden = !n; if ($("#ca_n")) { $("#ca_n").textContent = n; $("#confirmall").hidden = !n; } };
-  let bulk = false; const confirmCard = async (el, extra) => { if (el.classList.contains("going")) return; el.classList.add("going"); const j = await api("card/" + el.dataset.id, Object.assign({ action: "confirm", qty: +el.dataset.qty || 1 }, extra || {}));
+  let bulk = false; const confirmCard = async (el, extra) => { if (el.classList.contains("going")) return; el.classList.add("going"); const cb = Object.assign({ action: "confirm", qty: +el.dataset.qty || 1 }, extra || {}); const j = await api("card/" + el.dataset.id, cb);
+    if (j.offline) { OQ.add(+el.dataset.id, cb); PH.done(+el.dataset.id, !bulk); setTimeout(() => el.remove(), 260); left(); OQ.bar(); return; }   // no signal: kept on this phone, sent later
     if (j.ok) { setOpenBag(j); PH.done(+el.dataset.id, !bulk); setTimeout(() => el.remove(), 260); left(); if (TRAIN_SID) trainSoon(TRAIN_SID); } else { el.classList.remove("going"); toast(j.error || "failed"); } };
   // "Confirm all": every remaining card, with its current color / qty / part, goes into the open bag (in list order)
   const ca = $("#confirmall"); if (ca && !els.some(e => e.classList.contains("lotedit"))) ca.onclick = async () => { ca.disabled = true;
@@ -569,8 +574,10 @@ V.box = async (id, j) => { await palette(); j = j || await api("box/" + id); con
   $("#reopen") && ($("#reopen").onclick = async () => V.box(id, await api("box/" + id, { action: "reopen" })));
   $$(".rm").forEach(x => x.onclick = async () => V.box(id, await api("box/" + id, { action: "remove", code: x.dataset.c }))); };
 
-V.host = async () => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } await palette();
-  main.innerHTML = `<h1>Host · ${esc(ME.host.site_name)}</h1><p><a class="btn small" href="#/host/settings">Settings &amp; sorters</a> <a class="btn small gold" href="#/host/batch">Batch prep · box labels</a> <a class="btn small gold" href="#/host/labels">Bag labels</a> <a class="btn small" href="#/host/baglookup">Bag lookup</a> <a class="btn small" href="#/host/molds">Mold-variant exceptions</a> <a class="btn small" href="#/host/train">Training data</a> <a class="btn small" href="#/host/parts">Import parts file</a></p>
+V.host = async () => { if (canPrep() && ME.user.role !== "admin") { main.innerHTML = `<h1>Prep</h1><p class="muted small">As a prep helper you can make boxes, print box and bag labels, and look up bags.</p><p><a class="btn gold" href="#/host/batch">Batch prep · box labels</a> <a class="btn gold" href="#/host/labels">Bag labels</a> <a class="btn" href="#/host/baglookup">Bag lookup</a></p>`; return; }
+  if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } await palette();
+  main.innerHTML = `<h1>Host · ${esc(ME.host.site_name)}</h1><p><a class="btn small" href="#/host/settings">Settings &amp; sorters</a> <a class="btn small gold" href="#/host/batch">Batch prep · box labels</a> <a class="btn small gold" href="#/host/labels">Bag labels</a> <a class="btn small" href="#/host/baglookup">Bag lookup</a> <a class="btn small" href="#/host/molds">Mold-variant exceptions</a> <a class="btn small" href="#/host/train">Training data</a> <a class="btn small" href="#/host/parts">Import parts file</a> <a class="btn small" href="#/host/audit">Admin log</a></p>
+  <div class="card"><h3>Sessions &amp; pay</h3><p class="muted small">Every sorting session with sorter, Central times, bags, pieces, sorted weight and pay, as a spreadsheet file.</p><a class="btn wide" href="/alpha/api/host/pay.csv" download>⬇ Download sessions &amp; pay (CSV)</a></div>
   <div class="card"><h3>Download inventory file</h3><p class="muted small">All confirmed lots from every sorting session of this host, one line per part and color (.bsx file, price 0, condition used).</p><a class="btn wide" id="hostdl" href="/alpha/api/host/export" download>⬇ Download inventory file</a></div>
 `; };
 V.hostSettings = async (j, msg) => { j = j || await api("host"); if (j.error) { main.innerHTML = `<p class="err">${esc(j.error)}</p>`; return; } const h = j.host;
@@ -578,13 +585,18 @@ V.hostSettings = async (j, msg) => { j = j || await api("host"); if (j.error) { 
   <label>Pay sorters<select name="pay_mode"><option value="lb" ${h.pay_mode === "lb" ? "selected" : ""}>per lb sorted</option><option value="hr" ${h.pay_mode === "hr" ? "selected" : ""}>per hour</option></select></label>
   <div class="row2"><label>$ per lb<input name="rate_lb" type="number" step="0.01" value="${h.rate_lb}"></label><label>$ per hour<input name="rate_hr" type="number" step="0.01" value="${h.rate_hr}"></label></div>
   <label>"Low stock" below<input name="low_threshold" type="number" min="1" value="${h.low_threshold}"></label>
+  <label>Contact note for sorters (shown on Help; optional, 300 characters; only share contact details you are happy for every sorter to see)<textarea name="contact_note" maxlength="300" rows="3" placeholder="e.g. Text the GBL group chat, or tell Chris at pickup.">${esc(h.contact_note || "")}</textarea></label>
   <h3 class="sechead">Open bag</h3><label>Default pay share for new sorters (0 to 1; 0 = show parts value only). Each sorter’s own share is set under People.<input name="payout_share" type="number" step="0.01" min="0" max="1" value="${h.payout_share ?? 0}"></label>
   <p class="small muted">Fallback bag limits, used only when the host has no bag sizes:</p><div class="row2"><label>Bag full at (oz, 0 = off)<input name="bag_max_oz" type="number" step="0.1" min="0" inputmode="decimal" value="${num(ozOf(h.bag_max_g ?? 110))}"></label><label>…or at (cu in, 0 = off)<input name="bag_max_cuin" type="number" step="0.1" min="0" inputmode="decimal" value="${num(cuinOf(h.bag_max_cm3 ?? 250))}"></label></div>
   <label>Loose parts density (oz per cu in, in a bag)<input name="density_oz_cuin" type="number" step="0.001" min="0.03" max="1.2" inputmode="decimal" value="${num((h.loose_density ?? 0.4) * DENS, 3)}"></label><button class="btn gold wide">Save</button></form>
   <h2>Bag sizes</h2><p class="muted small">The open bag is full at whichever limit comes first. Pick a size per box in Batch prep (boxes without one use the first size).</p>
   <div id="bsz">${(j.bag_sizes || []).map(z => `<form class="card row2 bsz" data-id="${z.id}"><label>Name<input name="name" value="${esc(z.name)}" required></label><label>Max oz<input name="max_oz" type="number" min="0" step="0.1" inputmode="decimal" value="${num(ozOf(z.max_g))}"></label><label>Max cu in<input name="max_cuin" type="number" min="0" step="0.1" inputmode="decimal" value="${num(cuinOf(z.max_cm3))}"></label><span class="bszb"><button class="btn small gold">Save</button><button type="button" class="btn small ghost bszrm">Remove</button></span></form>`).join("") || `<p class="muted small">No bag sizes yet.</p>`}</div>
   <form class="card row2" id="bszadd"><label>New size<input name="name" placeholder="e.g. 6x9" required></label><label>Max oz<input name="max_oz" type="number" min="0" step="0.1" inputmode="decimal" value="3.9"></label><label>Max cu in<input name="max_cuin" type="number" min="0" step="0.1" inputmode="decimal" value="15.3"></label><span class="bszb"><button class="btn small gold">Add</button></span></form>
-  <h2>People</h2>${j.users.map(u => `<div class="row card"><b>${esc(u.username)}</b><span class="muted small grow">${esc(u.display)} · ${u.ns} sessions</span>${u.role === "sorter" ? `<form class="pays" data-u="${esc(u.username)}"><input name="pay_share" type="number" step="0.01" min="0" max="1" value="${u.pay_share || 0}" aria-label="pay share of parts value" title="pay share of parts value (0 = show parts value only)"><button class="btn small">Save pay</button></form>` : ""}${pill(u.role, "")}</div>`).join("")}
+  <h2>People</h2>${j.users.map(u => `<details class="card person" data-u="${esc(u.username)}"><summary class="row"><b>${esc(u.username)}</b><span class="muted small grow">${esc(u.display)} · ${u.ns} sessions${u.status === "disabled" ? " · <b class=\"err\">turned off</b>" : ""}${u.locked ? " · <b class=\"warn\">locked</b>" : ""}</span>${pill(u.role === "admin" ? "admin" : u.prep ? "prep" : "sorter")}</summary>
+   ${u.role === "sorter" ? `<form class="pays" data-u="${esc(u.username)}"><label class="grow">Pay share of parts value (0 to 1)<input name="pay_share" type="number" step="0.01" min="0" max="1" value="${u.pay_share || 0}"></label><button class="btn small">Save pay</button></form>` : ""}
+   <form class="row3 urole"><label>Role<select name="role"><option value="sorter"${u.role === "sorter" && !u.prep ? " selected" : ""}>Sorter</option><option value="prep"${u.prep ? " selected" : ""}>Prep helper (sorter + batch prep, labels, bag lookup)</option><option value="admin"${u.role === "admin" ? " selected" : ""}>Admin</option></select></label><button class="btn small"${u.me ? " disabled title=\"Ask another admin\"" : ""}>Save role</button></form>
+   <form class="row3 ureset"><label>New temporary password<input name="password" type="password" minlength="8" autocomplete="new-password" required></label><button class="btn small">Reset password</button></form>
+   <div class="ubtns">${u.me ? `<p class="small muted">This is you. Use <a href="#/account">Account</a> to change your password or log out everywhere.</p>` : `<button type="button" class="btn small ukill">Sign out everywhere</button><button type="button" class="btn small ${u.status === "disabled" ? "uon" : "uoff"}">${u.status === "disabled" ? "Turn on" : "Turn off"}</button><button type="button" class="btn small ghost urm">Remove</button>`}</div></details>`).join("")}
   <form class="card" id="as"><h3>Add a sorter</h3><label>Username<input name="username" autocapitalize="none" required></label><label>Name<input name="display"></label><label>Password<input name="password" type="password" minlength="8" required></label><button class="btn wide">Add sorter</button></form>
   <h2>Sessions &amp; pay</h2>${j.sessions.map(s => `<a class="row card" href="#/s/${s.id}"><b class="mono">${s.id}</b><span class="small">${esc(s.username)} · ${esc(s.pay)}</span>${pill(s.status)}</a>`).join("")}`;
   const fo = f => toMetric(Object.fromEntries(new FormData(f)));   // oz / lb / cu in typed -> g / cm³ stored
@@ -593,10 +605,17 @@ V.hostSettings = async (j, msg) => { j = j || await api("host"); if (j.error) { 
   $$("#bsz .bsz").forEach(f => { f.onsubmit = e => { e.preventDefault(); bs({ action: "edit", id: +f.dataset.id, ...fo(f) }); }; f.querySelector(".bszrm").onclick = () => { if (confirm("Remove this bag size?")) bs({ action: "remove", id: +f.dataset.id }); }; });
   $("#bszadd").onsubmit = e => { e.preventDefault(); bs({ action: "add", ...fo(e.target) }); };
   $$(".pays").forEach(f => f.onsubmit = async e => { e.preventDefault(); const r = await api("host/sorter/pay", { username: f.dataset.u, pay_share: f.pay_share.value }); toast(r.ok ? `Pay for ${r.username}: ${Math.round(r.pay_share * 100)}% of parts value` : r.error || "failed"); });
-  $("#as").onsubmit = async e => { e.preventDefault(); const r = await api("host/sorter", fo(e.target)); V.hostSettings(null, r.msg || r.error); }; };
+  $("#as").onsubmit = async e => { e.preventDefault(); const r = await api("host/sorter", fo(e.target)); V.hostSettings(null, r.msg || r.error); };
+  $$(".person").forEach(d => { const un = d.dataset.u, act = async (body, ask) => { if (ask && !confirm(ask)) return; const r = await api("host/user", { username: un, ...body }); V.hostSettings(null, r.msg || r.error); };
+    d.querySelector(".urole").onsubmit = e => { e.preventDefault(); act({ action: "role", role: e.target.role.value }); };
+    d.querySelector(".ureset").onsubmit = e => { e.preventDefault(); act({ action: "reset", password: e.target.password.value }, `Set a new password for ${un}? They are signed out on every phone.`); };
+    d.querySelector(".ukill") && (d.querySelector(".ukill").onclick = () => act({ action: "kill" }, `Sign ${un} out on every phone?`));
+    d.querySelector(".uoff") && (d.querySelector(".uoff").onclick = () => act({ action: "disable" }, `Turn off ${un}? They can't sign in and are signed out everywhere. Their sessions and pay records stay.`));
+    d.querySelector(".uon") && (d.querySelector(".uon").onclick = () => act({ action: "enable" }));
+    d.querySelector(".urm") && (d.querySelector(".urm").onclick = () => act({ action: "remove" }, `Remove ${un}? Only possible for an account with no sorting sessions.`)); }); };
 
 // ---- batch prep (admin): make boxes with N bag QRs and print one sheet per box (master QR + bag 1..N QRs with write-in lines). Labels are printed here, not by sorters.
-V.hostBatch = async () => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } const j = await api("host/batch");
+V.hostBatch = async () => { if (!canPrep()) { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } const j = await api("host/batch");
   main.innerHTML = `<h1>Batch prep</h1><ol class="steps small"><li>Weigh the batch and put it in a box.</li><li>Create the box here and print its label (master QR + shelf location).</li><li>Hand over the box with labeled bags; the sorter scans the box, then each bag.</li></ol>
   <form class="card" id="bf"><div class="row2"><label>Boxes<input name="boxes" type="number" min="1" max="20" value="1" inputmode="numeric"></label><label>Bag size<select name="bag_size">${(j.bag_sizes || []).map(z => `<option value="${z.id}">${esc(z.name)} · ${fmtW(z.max_g)} / ${fmtV(z.max_cm3)}</option>`).join("") || `<option value="">host default</option>`}</select></label></div>
   <div class="row2"><label>Batch weight (lb)<input name="batch_lb" type="number" min="0.01" step="0.01" inputmode="decimal" placeholder="weigh it now"></label><label>Assigned sorter (optional)<select name="sorter"><option value="">anyone</option>${(j.sorters || []).map(u => `<option>${esc(u)}</option>`).join("")}</select></label></div>
@@ -605,12 +624,12 @@ V.hostBatch = async () => { if (ME?.user.role !== "admin") { main.innerHTML = `<
   $("#bf").onsubmit = async e => { e.preventDefault(); const f = e.target, g = [f.g_s.value, f.g_r.value, f.g_c.value].map(v => v.trim().toUpperCase()); if (g.some(Boolean) && !g.every(Boolean)) return toast("Fill shelf, row and col (or none)");
     const r = await api("host/batch", { boxes: +f.boxes.value, shelf: g.every(Boolean) ? g.join("-") : "", weight_g: f.batch_lb.value ? toMetric({ batch_lb: f.batch_lb.value }).weight_g : null, sorter: f.sorter.value || null, bag_size_id: +f.bag_size.value || null }); if (!r.ok) return toast(r.error || "failed");
     location.hash = r.boxes.length === 1 ? "#/host/sheet/" + r.boxes[0] : "#/host/batch"; if (r.boxes.length > 1) V.hostBatch(); }; };
-V.hostSheet = async id => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } const j = await api("host/sheet/" + id); if (j.error) { main.innerHTML = `<p class="err">${esc(j.error)}</p>`; return; }
+V.hostSheet = async id => { if (!canPrep()) { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } const j = await api("host/sheet/" + id); if (j.error) { main.innerHTML = `<p class="err">${esc(j.error)}</p>`; return; }
   main.innerHTML = `<div class="noprint card center"><b>Box label</b><br><button class="btn gold" id="prt">🖨 Print</button> <a class="btn ghost" href="#/host/batch">Back</a></div>
   <div class="sheet-print"><div class="boxlabel"><div class="bl-loc">${j.box.shelf ? esc(gridLoc(j.box.shelf)) : "no location"}</div><div class="master"><img class="q" src="${qrURL(j.box.barcode)}" alt=""><div><div class="small">BOX · scan first</div><div class="c mono">${esc(j.box.barcode)}</div>${j.box.batch_weight_g ? `<div class="small">Batch ${esc(fmtW(j.box.batch_weight_g))}</div>` : ""}<div class="wl">Sorter</div><div class="wl">Date</div></div></div></div></div>`;
   $("#prt").onclick = () => print(); };
 // pre-labeled bag supply: print a range of permanent bag QRs (no box); reprint by range
-V.hostLabels = async (j) => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } const st = await api("host/bag-labels");
+V.hostLabels = async (j) => { if (!canPrep()) { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } const st = await api("host/bag-labels");
   main.innerHTML = `<div class="noprint"><h1>Bag labels</h1><p class="muted small">Each bag gets one permanent QR. Sorters scan any unused labeled bag; the app numbers it within the box. ${st.free} unused label${st.free === 1 ? "" : "s"} on hand.</p>
   <form class="card" id="lf"><div class="row2"><label>New labels<input name="count" type="number" min="1" max="200" value="30" inputmode="numeric"></label><button class="btn gold">Make + print</button></div></form>
   <form class="card" id="rf"><div class="row3"><label>Reprint from #<input name="from" inputmode="numeric"></label><label>to #<input name="to" inputmode="numeric"></label><button class="btn">Show</button></div></form>
@@ -620,7 +639,7 @@ V.hostLabels = async (j) => { if (ME?.user.role !== "admin") { main.innerHTML = 
   $("#rf").onsubmit = async e => { e.preventDefault(); const r = await api(`host/bag-labels?from=${+e.target.from.value}&to=${+e.target.to.value}`); if (r.error) return toast(r.error); V.hostLabels(r); };
   $("#prt") && ($("#prt").onclick = () => print()); };
 // admin bag lookup: scan or type any bag QR -> box, bag number, sorter, dates, contents; mark missing / moved
-V.hostBagLookup = async (code, j) => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } await palette();
+V.hostBagLookup = async (code, j) => { if (!canPrep()) { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } await palette();
   if (code && !j) j = await api("host/bag/" + encodeURIComponent(code)); const b = j?.bag;
   const when = t => esc(ctime(t));
   main.innerHTML = `<h1>Bag lookup</h1><p class="muted small">Scan or type any bag QR to see where it belongs, e.g. a bag found loose or missing from its box.</p>
@@ -687,15 +706,68 @@ V.hostParts = async msg => { if (ME?.user.role !== "admin") { main.innerHTML = `
 
 // ---------------- router
 async function loadMe() { const j = await api("me"); ME = j.error ? null : j; header(); return ME; }
-function header() { $("#who").innerHTML = ME ? `<span class="hn">${esc(ME.host.site_name)} · </span>${esc(ME.user.username)}` : ""; $("#tabs").hidden = !ME; $("#hosttab").hidden = !(ME && ME.user.role === "admin"); }
+const canPrep = () => !!(ME && (ME.user.role === "admin" || ME.user.prep));
+function header() { $("#who").innerHTML = ME ? `<a href="#/account" class="whoa" title="Your account"><span class="hn">${esc(ME.host.site_name)} · </span>${esc(ME.user.username)}</a>` : ""; $("#tabs").hidden = !ME; $("#logoutbtn").hidden = !ME; $("#adminlink").href = ME && ME.user.role === "admin" ? "#/host" : "#/login?admin"; $("#hosttab").hidden = !canPrep(); $("#hosttab").lastChild.textContent = ME && ME.user.role !== "admin" ? "Prep" : "Host"; }
+// ---- offline confirmations: kept on this phone (localStorage, per session) and sent in order once back online.
+// A queued card is hidden from the list; the open bag catches up after the sync. The server still has the card as pending, so nothing is lost if this phone's storage is cleared: the card simply shows up again.
+const OQ = (() => { const sid = () => location.hash.match(/#\/s\/([\w-]+)/)?.[1], key = id => "pts-oq:" + id;
+  const get = (id = sid()) => { try { return JSON.parse(localStorage.getItem(key(id)) || "[]"); } catch (e) { return []; } }, put = (q, id = sid()) => q.length ? localStorage.setItem(key(id), JSON.stringify(q)) : localStorage.removeItem(key(id));
+  let busy = false;
+  const bar = () => { const q = get(), host = $("#oqbar"); if (!host) return; host.hidden = !q.length; host.innerHTML = q.length ? `<div><b>${q.length} card${q.length === 1 ? "" : "s"} saved on this phone</b><div class="small">Confirmed while offline. They are sent to the open bag when you are back online. Don’t clear this browser’s data until then.</div></div><button type="button" class="btn small gold" id="oqsync">Send now</button>` : "";
+    $("#oqsync") && ($("#oqsync").onclick = () => sync(true)); };
+  const sync = async manual => { const id = sid(); if (busy || !id) return; let q = get(id); if (!q.length) return; busy = true; let sent = 0, dropped = 0;
+    try { while (q.length) { const it = q[0], j = await api("card/" + it.id, it.body); if (j.offline) { if (manual) toast("Still offline: the cards stay on this phone.", 3500); break; }
+        if (!j.ok) dropped++; else sent++; q = q.slice(1); put(q, id); } } finally { busy = false; }
+    if (sent || dropped) { toast(`${sent} saved card${sent === 1 ? "" : "s"} sent to the open bag${dropped ? ` · ${dropped} could not be added (already changed); check the list` : ""}`, 4500); if (sid() === id) route(); } else bar(); };
+  addEventListener("online", () => setTimeout(() => sync(false), 800));
+  return { add: (cardId, body) => { const q = get(); if (!q.some(x => x.id === cardId)) q.push({ id: cardId, body, t: Date.now() }); put(q); }, ids: () => new Set(get().map(x => x.id)), bar, sync }; })();
+// ---- account: change password, log out everywhere
+V.account = () => { main.innerHTML = `<h1>Account</h1><p class="muted small">Signed in as <b>${esc(ME.user.username)}</b> at ${esc(ME.host.site_name)}${ME.user.pw_changed ? ` · password last changed ${esc(ctime(ME.user.pw_changed))}` : ""}.</p><p class="okmsg" id="amsg" role="status"></p>
+  <form class="card" id="pwf"><h3>Change password</h3><label>Current password<input name="current" type="password" autocomplete="current-password" required></label><label>New password (8 or more characters)<input name="password" type="password" minlength="8" autocomplete="new-password" required></label><label>New password again<input name="again" type="password" minlength="8" autocomplete="new-password" required></label><p class="err" id="pwerr" role="alert"></p><button class="btn gold wide">Change password</button><p class="small muted">Changing it signs you out on your other phones.</p></form>
+  <div class="card"><h3>Lost a phone?</h3><p class="small muted">Sign out on every phone and browser, this one too. You then sign in again here.</p><button type="button" class="btn wide" id="outall">Log out everywhere</button></div>
+  <p class="center"><a href="#/pay" class="btn">My pay</a> <a href="#/help" class="btn">Help</a> <a href="#/privacy" class="btn ghost">Privacy &amp; terms</a></p>`;
+  $("#pwf").onsubmit = async e => { e.preventDefault(); const f = e.target; if (f.password.value !== f.again.value) return $("#pwerr").textContent = "The two new passwords don’t match.";
+    const r = await api("account/password", { current: f.current.value, password: f.password.value }); if (!r.ok) return $("#pwerr").textContent = r.error || "failed"; f.reset(); $("#pwerr").textContent = ""; await loadMe(); $("#amsg").textContent = r.msg; };
+  $("#outall").onclick = async () => { if (!confirm("Log out on every phone and browser, including this one?")) return; await api("account/logout-all", {}); localStorage.removeItem("pts-in"); SIGNIN_MSG = "You logged out everywhere. Sign in again on this phone."; ME = null; header(); location.hash = "#/login"; }; };
+// ---- my pay: own totals by week and month (Central time); never anyone else's
+V.pay = async () => { const j = await api("me/pay"); if (j.error) { main.innerHTML = `<p class="err">${esc(j.error)}</p>`; return; }
+  const basis = j.pay_mode === "hr" ? `$${(+j.rate).toFixed(2)} per hour` : `$${(+j.rate).toFixed(2)} per lb sorted`;
+  const tbl = (rows, lbl) => rows.length ? `<table class="paytbl"><thead><tr><th>${lbl}</th><th>Sessions</th><th>${j.pay_mode === "hr" ? "Hours" : "Sorted"}</th><th>Pay</th></tr></thead><tbody>${rows.map(r => `<tr><td>${esc(lbl === "Week of" ? new Date(r.k + "T12:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" }) : new Date(r.k + "-15T12:00:00").toLocaleDateString("en-US", { month: "long", year: "numeric" }))}</td><td>${r.sessions}</td><td>${j.pay_mode === "hr" ? `${num(r.hours, 1)} h` : `${num(r.lb, 2)} lb`}</td><td><b>${fmt$(r.pay)}</b>${r.missing_weight ? `<br><span class="small warn">${r.missing_weight} without weight</span>` : ""}</td></tr>`).join("")}</tbody></table>` : `<p class="muted small">No sessions yet.</p>`;
+  main.innerHTML = `<h1>My pay</h1><p class="muted small">Your own sessions only, at ${esc(basis)}. Weeks start Monday, Central time (CT). Sessions without a sorted weight count as $0 until the weight is entered. This is an estimate; your host confirms the final pay.</p>
+  <div class="card"><h3>By week</h3>${tbl(j.weeks, "Week of")}</div><div class="card"><h3>By month</h3>${tbl(j.months, "Month")}</div>`; };
+// ---- help, FAQ, contact your host
+V.help = () => { const note = ME?.host?.contact_note;
+  main.innerHTML = `<h1>Help</h1><div class="faq">${[
+   ["How do I start?", "Tap Start a sorting session on the home screen, scan the box’s master QR, then scan a labeled bag and write the number the app shows on the bag."],
+   ["The camera won’t open", "Allow camera access for this site in your phone’s settings, or type the code from the label and press Enter (Go on the phone keyboard)."],
+   ["The app says a label is already used or retired", "Set that bag aside and scan a fresh labeled bag. Tell your host about the old one."],
+   ["What do oz, lb and cu in mean here?", "Bag limits are shown in ounces and cubic inches; sorted weight and pay use pounds. Times are Central time (CT)."],
+   ["A part was recognised wrong", "Tap the card’s color or part to fix it, change the count with − and +, or Drop it. Only confirmed cards go into the bag."],
+   ["The bag or box is full", "Scan the next labeled bag to seal the bag you are filling. For a full box tap Box full and put it away at the shelf it shows."],
+   ["I lost signal", "A red bar shows while you are offline. Scans and confirmed cards are kept on this phone and sent when you are back online. Don’t clear the browser data until they are sent."],
+   ["How is my pay worked out?", "See My pay. Your host sets the rate; the numbers there are an estimate until your host confirms them."],
+   ["I forgot my password", "Ask your host to set a temporary one, then change it under Account."]].map(([q, a]) => `<details class="card"><summary><b>${esc(q)}</b></summary><p>${esc(a)}</p></details>`).join("")}</div>
+  <div class="card" id="contact"><h3>Contact your host</h3>${note ? `<p class="contactnote">${esc(note)}</p>` : `<p>Ask your host in person or through the channel they gave you when you picked up your box.</p>`}<p class="small muted">Say which session (for example ${esc((ME && "S-…") || "")}) and what you were doing; a screenshot helps.</p></div>
+  <p class="center"><a href="#/privacy" class="btn ghost">Privacy &amp; terms</a></p>`;
+  if (/[?&]contact/.test(location.hash)) $("#contact").scrollIntoView(); };
+// ---- privacy & terms (alpha)
+V.privacy = () => { main.innerHTML = `<h1>Privacy &amp; terms</h1><div class="card legal"><p><b>This is an alpha test.</b> Things may change or break, and data may be reset.</p>
+  <h3>What we keep</h3><ul><li>Your username, name and an encrypted (hashed) password.</li><li>Your sorting sessions: times, bags, boxes, the parts you confirmed and the sorted weight.</li><li>Small cropped photos of single parts, used to recognise parts and to improve recognition. Lay parts on a plain surface and keep people, faces and papers out of the photo.</li><li>A log of admin actions (for example password resets and pay changes).</li></ul>
+  <h3>Who sees it</h3><ul><li>Your host’s admins see your sessions and pay. Other sorters never see your pay.</li><li>Part photos are sent to a part-recognition service to identify the part.</li><li>We don’t sell your data and don’t use advertising trackers.</li></ul>
+  <h3>Your choices</h3><ul><li>Ask your host to correct or delete your account and data.</li><li>Change your password or log out everywhere under Account.</li></ul>
+  <h3>Terms</h3><ul><li>Use the app only to sort parts for your host. Pay shown in the app is an estimate; your host’s agreement with you decides the final pay.</li><li>The app is provided as is, without warranty, during the alpha.</li></ul></div>`; };
+// ---- admin log
+V.hostAudit = async () => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } const j = await api("host/audit");
+  main.innerHTML = `<h1>Admin log</h1><p class="muted small">Account, pay, settings and data changes made by admins, newest first. Central time (CT).</p>${(j.entries || []).map(e => `<div class="card row small auditrow"><span class="grow"><b>${esc(e.action)}</b>${e.target ? ` · ${esc(e.target)}` : ""}${e.detail ? `<br><span class="muted">${esc(e.detail)}</span>` : ""}</span><span class="muted">${esc(ctime(e.at))}<br>by ${esc(e.username || "?")}</span></div>`).join("") || `<p class="muted">Nothing logged yet.</p>`}`; };
 async function route() {
   const h = location.hash.slice(1) || "/", [path, qs] = h.split("?");
-  if (path === "/logout") { await api("logout", {}); ME = null; header(); location.hash = "#/login"; return; }
+  if (path === "/logout") { localStorage.removeItem("pts-in"); SIGNIN_MSG = ""; await api("logout", {}); ME = null; header(); location.hash = "#/login"; return; }
+  if (path === "/privacy" && !ME && !localStorage.getItem("pts-in")) return V.privacy();   // readable signed out too (footer link on the sign-in page)
   if (path !== "/login" && !ME && !(await loadMe())) { location.hash = "#/login"; return; }
   const tab = path.startsWith("/box") ? "box" : path.startsWith("/putaway") ? "box" : path.startsWith("/host") ? "host" : "sort";
   $$("#tabs a").forEach(a => a.classList.toggle("on", a.dataset.t === tab));
   let m; window.scrollTo(0, 0);
-  if (path === "/login") return V.login();
+  if (path === "/login") return V.login(qs || "");
   if (path === "/") return V.home();
   if ((m = path.match(/^\/s\/([\w-]+)$/))) return V.session(m[1]);
   if ((m = path.match(/^\/bag\/([\w-]+)$/))) return V.bag(m[1]);
@@ -711,6 +783,11 @@ async function route() {
   if (path === "/host/labels") return V.hostLabels();
   if ((m = path.match(/^\/host\/baglookup(?:\/([\w-]+))?$/))) return V.hostBagLookup(m[1] ? decodeURIComponent(m[1]) : "");
   if (path === "/putaway") return V.putaway();
+  if (path === "/account") return V.account();
+  if (path === "/pay") return V.pay();
+  if (path === "/help") return V.help();
+  if (path === "/privacy") return V.privacy();
+  if (path === "/host/audit") return V.hostAudit();
   main.innerHTML = `<div class="card"><h2>Page not found</h2><a class="btn gold wide" href="#/">Go home</a></div>`;
 }
 window.addEventListener("hashchange", route); route();
