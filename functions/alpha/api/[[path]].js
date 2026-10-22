@@ -9,7 +9,7 @@ const now = () => new Date().toISOString().replace("T", " ").slice(0, 19);
 const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, "0")).join("");
 const rnd = n => hex(crypto.getRandomValues(new Uint8Array(n)));
 const enc = new TextEncoder();
-const QR_TTL = 7 * 864e5, PREP_TTL = 90 * 864e5;   // batch-prep sheets are printed ahead of time
+const QR_TTL = 7 * 864e5, PREP_TTL = 90 * 864e5, LABEL_TTL = 100 * 365 * 864e5;   // pre-labeled bags are permanent   // batch-prep sheets are printed ahead of time
 
 async function pbkdf2(pw, saltHex, it) {
   const k = await crypto.subtle.importKey("raw", enc.encode(pw), "PBKDF2", false, ["deriveBits"]);
@@ -38,7 +38,7 @@ const CARD_COLS = ["id", "session_id", "part", "name", "color", "qty", "confiden
 const cardRow = c => Object.fromEntries(CARD_COLS.filter(k => k in c).map(k => [k, c[k]]));
 function pay(s, host) {
   if (host.pay_mode === "hr") { const h = ((s.ended ? Date.parse(s.ended + "Z") : Date.now()) - Date.parse(s.started + "Z")) / 36e5; return `$${(h * host.rate_hr).toFixed(2)} (${h.toFixed(2)} h × $${host.rate_hr.toFixed(2)})`; }
-  return s.weight_lb ? `$${(s.weight_lb * host.rate_lb).toFixed(2)} (${s.weight_lb} lb × $${host.rate_lb.toFixed(2)})` : "weight not entered";
+  return s.weight_lb ? `$${(s.weight_lb * host.rate_lb).toFixed(2)} (${s.weight_lb} lb × $${host.rate_lb.toFixed(2)})` : "sorted weight not entered";
 }
 // A bag (one PTS- QR) holds many lots. Lots are the confirmed cards whose bag_code is the bag's code; removed lots get status "removed".
 // ---- open-bag meter: running weight (g), bag volume (cm3), pieces and parts value from the shared parts data.
@@ -80,8 +80,19 @@ function repo(hs) {
       for (const o of out) if (o.box_id !== null && o.box_id !== undefined) o.n = await R.bagN(o);   // number within its box, same as the seal toast and batch summary
       return out; },
     openLots: async sid => (await hs.list("cards", { session_id: sid, status: "confirmed", bag_code: null }, "id")).map(cardIn),
-    bagN: async b => (await hs.list("bags", { box_id: b.box_id, status: { ne: "void" } }, "id")).findIndex(x => x.code === b.code) + 1 || null,
+    bagN: async b => b.box_n ?? ((await hs.list("bags", { box_id: b.box_id, status: { ne: "void" } }, "id")).findIndex(x => x.code === b.code) + 1 || null),
     bagOut: async b => (await R.bagsOut([b]))[0],
+    retired: b => b.trace === "retired" || (!/^BG\d+$/.test(b.code) && b.status === "labelled" && !b.session_id && !b.box_n && !(+b.qty)),
+    labelCode: k => `BG${String(hs.hostId ?? "").padStart(2, "0")}${String(k).padStart(6, "0")}`,
+    // the bag the sorter is filling now: scanned into the session's box, not sealed
+    curBag: async s => s.box_id ? (await hs.list("bags", { session_id: s.id, box_id: s.box_id, status: "labelled" }, "id desc")).find(b => b.box_n && !b.sealed_at) || null : null,
+    seal: async (s, bag, ol) => { const t = now();
+      await hs.batch([hs.updateStmt("cards", { id: ol.map(c => c.id) }, { bag_code: bag.code }), hs.updateStmt("bags", { id: bag.id }, { status: "bagged", sealed_at: t }),
+        hs.updateStmt("qrcodes", { code: bag.code }, { status: "used" })]);
+      Object.assign(bag, { status: "bagged", sealed_at: t }); await R.syncBag(bag); await hs.staleTotals(); const bo = await R.bagOut(bag);
+      return { ...bo, n: bag.box_n }; },
+    release: async bag => { await hs.batch([hs.updateStmt("bags", { id: bag.id }, { box_id: null, box_n: null, session_id: null, user_id: null, location: "" }),
+      hs.updateStmt("qrcodes", { code: bag.code }, { session_id: null, user_id: null, status: "issued" })]); },
     // keep the bag row's summary columns (first lot + total qty) in step with its lots
     syncBag: async b => { const ls = await R.lots(b), f = ls[0] || {}, q = ls.reduce((a, c) => a + c.qty, 0), nm = ls.length > 1 ? `${ls.length} lots` : (f.name || "");
       if (b.part !== (f.part || "") || b.color !== (f.color ?? 0) || b.qty !== q || b.name !== nm) { Object.assign(b, { part: f.part || "", color: f.color ?? 0, qty: q, name: nm }); await hs.update("bags", { id: b.id }, { part: b.part, color: b.color, qty: b.qty, name: b.name }); } },
@@ -157,7 +168,7 @@ export async function onRequest(ctx) {
   const MET = req.headers.get("x-pts-meter") === "1" ? meter(env.PTSDB) : null;
   const D1 = MET || env.PTSDB, sh = sharedStore(D1);
   const J2 = (o, s = 200, h = {}) => J(o, s, MET ? { ...h, "x-pts-rows-read": String(MET.m.rows_read), "x-pts-rows-written": String(MET.m.rows_written), "x-pts-queries": String(MET.m.q) } : h);
-  const E2 = (m, s = 400) => J2({ error: m }, s);
+  const E2 = (m, s = 400, x = {}) => J2({ error: m, ...x }, s);
   if (!MIGRATED) { await migrateFromKV({ ...env, PTSDB: D1 }); await ensureIndexes(D1); MIGRATED = true; }
   if (!SECRET) SECRET = await sh.meta("secret");
   const secret = SECRET;
@@ -223,15 +234,21 @@ export async function onRequest(ctx) {
     const bags = await R.bagsOut(await hs.list("bags", { session_id: s.id, status: { ne: "void" } }, "id desc"));
     const openLots = (await R.openLots(s.id)).map(lotOut), box = s.box_id ? await hs.get("boxes", { id: s.box_id }) : null;
     const sealed = bags.filter(b => b.lots.length), per = [];
-    for (const b of sealed) per.push({ code: b.code, n: b.box_id === s.box_id ? await R.bagN(b) : null, ...(await meterOf(sh, b.lots, host, await capsOf(s))) });
+    // one bag number everywhere (summary, sealed list, toasts): its number in the box, else (older bags without a box) its order in this session
+    [...sealed].sort((a, b) => a.id - b.id).forEach((b, i) => { if (b.n === null || b.n === undefined) b.n = i + 1; });
+    for (const b of sealed) per.push({ code: b.code, n: b.n ?? null, box_code: b.box_code, ...(await meterOf(sh, b.lots, host, await capsOf(s))) });
     const tot = { bags: per.length, pcs: per.reduce((a, b) => a + b.pcs, 0), weight_g: Math.round(per.reduce((a, b) => a + b.weight_g, 0) * 10) / 10, value: Math.round(per.reduce((a, b) => a + b.value, 0) * 100) / 100,
       approx: per.some(b => b.approx), batch_weight_g: box?.batch_weight_g ?? null, share: +(await capsOf(s)).share || 0 };
     tot.earnings = tot.share > 0 ? Math.round(tot.value * tot.share * 100) / 100 : null;
-    return J2({ s, pay: pay(s, host), owner: owner?.username, cards, bags, box, open_lots: openLots, meter: await meterOf(sh, openLots, host, await capsOf(s)), summary: { ...tot, per_bag: per } });
+    const cb = s.status === "open" ? await R.curBag(s) : null;
+    return J2({ s, pay: pay(s, host), owner: owner?.username, cards, bags, box, cur_bag: cb ? { code: cb.code, n: cb.box_n } : null, open_lots: openLots, meter: await meterOf(sh, openLots, host, await capsOf(s)), summary: { ...tot, per_bag: per } });
   }
   if ((m = path.match(/^session\/([\w-]+)\/end$/)) && M === "POST") {
     const s = await sess(m[1]); if (!mine(s)) return E2("not found", 404);
-    if ((await R.openLots(s.id)).length && !body.force) return E2("The open bag still has parts: scan a bag label to seal them first", 409);
+    const ol = await R.openLots(s.id), cur = s.status === "open" ? await R.curBag(s) : null;
+    if (ol.length && cur) await R.seal(s, cur, ol);   // ending the session seals the bag being filled
+    else if (ol.length && !body.force) return E2("Parts are waiting with no bag: scan a bag to put them in first", 409);
+    else if (cur) await R.release(cur);   // scanned but never filled: back to the supply
     await hs.put("sessions", { ...s, status: "closed", ended: now(), weight_lb: body.weight_lb ? +body.weight_lb : null }); return J2({ ok: true });
   }
   if (path === "identify" && M === "POST") {
@@ -332,22 +349,44 @@ export async function onRequest(ctx) {
     if (/^BX\d+$/.test(code)) { const box = await hs.get("boxes", { barcode: code }); if (!box) return E2(`${code}: not a known box QR`, 404);
       if (s.box_id && s.box_id !== box.id) return E2("this session already works on another box", 409);
       if (box.sorter_id && box.sorter_id !== s.user_id) return E2("this box is prepared for another sorter", 409);
-      if ((await hs.list("sessions", { box_id: box.id })).some(x => x.id !== s.id)) return E2("this box is already used by another sorting session", 409);
-      const bs = await hs.list("bags", { box_id: box.id, status: { ne: "void" } }, "id"); if (!bs.length) return E2("this box has no bag QRs; print its sheet from Batch prep");
-      if (bs.some(b => b.session_id && b.session_id !== s.id)) return E2("this box is already used by another sorting session", 409);
+      const other = (await hs.list("sessions", { box_id: box.id })).find(x => x.id !== s.id);
+      if (other) return E2(other.status === "open" ? `Box ${code} is open in session ${other.id}.` : "this box is already used by another sorting session", 409, other.status === "open" ? { in_use: other.id } : undefined);
+      if (box.closed_at) return E2(`${code} was closed as full: reopen it or scan a new box`, 409, { closed_box: { id: box.id, barcode: box.barcode, bags: (await hs.list("bags", { box_id: box.id, status: { ne: "void" } })).length } });
+      const bs = await hs.list("bags", { box_id: box.id, status: { ne: "void" } }, "id");
+      const busy = bs.find(b => b.session_id && b.session_id !== s.id && !b.sealed_at && b.status === "labelled");
+      if (busy) return E2(`Box ${code} is open in session ${busy.session_id}.`, 409, { in_use: busy.session_id });   // sealed bags of an earlier session are fine (reopened box)
       s.box_id = box.id; await hs.update("sessions", { id: s.id }, { box_id: box.id });
       return J2({ ok: true, box, sealed: null }); }
-    const bag = await R.bag(code); if (!bag || bag.status === "void") return E2(`${code}: not a known box or bag QR`, 404);
+    const bag = await R.bag(code);
+    // old pre-printed per-box bag QRs (batch-prep sheets) are retired: only GBL labeled bags (BG...) are handed out now
+    if (bag && R.retired(bag)) return E2("This QR is from an old per-box bag sheet and is no longer used. Set the bag aside and scan a GBL labeled bag.", 409, { retired: true });
+    if (!bag || bag.status === "void") return E2(`${code}: not a known box or bag QR`, 404);
     if (!s.box_id) return E2("Scan the box master QR first", 409);
-    if (bag.box_id !== s.box_id) return E2("this bag label belongs to another box", 409);
-    if (bag.session_id && bag.session_id !== s.id) return E2("this bag belongs to another sorting session", 409);
-    if (bag.status !== "labelled" || (await R.lots(bag)).length) return E2("this bag label is already used; scan an unused bag label of this box", 409);
-    const ol = await R.openLots(s.id); if (!ol.length) return E2("The open bag is empty: confirm some parts first", 409);
-    await hs.batch([hs.updateStmt("cards", { id: ol.map(c => c.id) }, { bag_code: bag.code }), hs.updateStmt("bags", { id: bag.id }, { session_id: s.id, user_id: s.user_id, status: "bagged" }),
-      hs.updateStmt("qrcodes", { code: bag.code }, { session_id: s.id, user_id: s.user_id, status: "used" })]);
-    Object.assign(bag, { session_id: s.id, user_id: s.user_id, status: "bagged" }); await R.syncBag(bag); await hs.staleTotals();
-    const bo = await R.bagOut(bag);
-    return J2({ ok: true, sealed: { ...bo, n: await R.bagN(bag), meter: await meterOf(sh, bo.lots, host, await capsOf(s)) } });
+    const box = await hs.get("boxes", { id: s.box_id }), cur = await R.curBag(s);
+    if (cur && cur.code === bag.code) return E2(`This is already the open bag: Bag ${cur.box_n}`, 409);
+    // pre-labeled supply: a free label has no box yet (or, for older sheets, belongs to this box unused); anything else is used and must not be reused
+    const used = bag.trace || bag.sealed_at || bag.status !== "labelled" || (bag.session_id && bag.session_id !== s.id) || (bag.box_id && bag.box_id !== s.box_id) || bag.box_n || (await R.lots(bag)).length;
+    if (used) { const bx = bag.box_id ? await hs.get("boxes", { id: bag.box_id }) : null;
+      return E2(`Bag label ${bag.code} is already used${bx ? ` (box ${bx.barcode}${bag.box_n ? `, Bag ${bag.box_n}` : ""})` : ""}. Set it aside and scan a fresh bag.`, 409, { used: true }); }
+    const ol = await R.openLots(s.id); let sealed = null;
+    if (cur) { if (!ol.length) return E2(`Bag ${cur.box_n} is still empty: confirm some parts into it first`, 409); sealed = await R.seal(s, cur, ol); sealed.meter = await meterOf(sh, sealed.lots, host, await capsOf(s)); }
+    // no bag yet but confirmed parts waiting: they simply belong to this first bag
+    const n = ((await hs.list("bags", { box_id: box.id, status: { ne: "void" } })).reduce((a, b) => Math.max(a, b.box_n || 0), 0)) + 1;
+    Object.assign(bag, { box_id: box.id, box_n: n, session_id: s.id, user_id: s.user_id, location: box.shelf || "" });
+    await hs.batch([hs.updateStmt("bags", { id: bag.id }, { box_id: box.id, box_n: n, session_id: s.id, user_id: s.user_id, location: bag.location }),
+      hs.updateStmt("qrcodes", { code: bag.code }, { session_id: s.id, user_id: s.user_id, status: "open" })]); await hs.staleTotals();
+    return J2({ ok: true, bag: { code: bag.code, n, box_code: box.barcode }, sealed });
+  }
+  // "Box full": seal the current bag (if it has parts), close the box; the sorter scans a new box and numbering restarts at 1
+  if ((m = path.match(/^session\/([\w-]+)\/box-full$/)) && M === "POST") {
+    const s = await sess(m[1]); if (!mine(s) || s.status !== "open") return E2("session not open");
+    if (!s.box_id) return E2("No box is open", 409);
+    const box = await hs.get("boxes", { id: s.box_id }), cur = await R.curBag(s), ol = await R.openLots(s.id); let sealed = null;
+    if (ol.length && !cur) return E2("Parts are waiting with no bag: scan a bag to put them in first", 409);
+    if (cur) sealed = ol.length ? await R.seal(s, cur, ol) : (await R.release(cur), null);
+    if (sealed) sealed.meter = await meterOf(sh, sealed.lots, host, await capsOf(s));
+    await hs.batch([hs.updateStmt("boxes", { id: box.id }, { closed_at: now() }), hs.updateStmt("sessions", { id: s.id }, { box_id: null })]);
+    return J2({ ok: true, closed: { code: box.barcode, shelf: box.shelf || "", bags: (await hs.list("bags", { box_id: box.id, status: { ne: "void" } })).filter(b => b.sealed_at || b.status === "bagged").length }, sealed });
   }
   if ((m = path.match(/^bag\/([\w-]+)\/close$/)) && M === "POST") {
     const b = await R.bag(m[1]); if (!b || !mine(await sess(b.session_id))) return E2("not found", 404);
@@ -384,6 +423,7 @@ export async function onRequest(ctx) {
     if (M === "POST") {
       if (body.action === "shelf") { box.shelf = String(body.shelf || "").trim().toUpperCase().slice(0, 24); await hs.put("boxes", box); await hs.update("bags", { box_id: box.id }, { location: box.shelf }); msg = "Shelf address saved."; }
       if (body.action === "add") return E2("bags are added to boxes in Batch prep", 400);
+      if (body.action === "reopen") { if (!box.closed_at) return E2("this box is not closed", 409); box.closed_at = null; await hs.update("boxes", { id: box.id }, { closed_at: null }); msg = `Box ${box.barcode} reopened: bag numbers continue.`; }   // anyone on the host (sorter or admin)
       if (body.action === "remove") { const b = await R.bag(body.code); if (b && b.box_id === box.id) await hs.update("bags", { id: b.id }, { box_id: null }); }
     }
     return J2({ box, msg, bags: await R.bagsOut(await hs.list("bags", { box_id: box.id, status: { ne: "void" } }, "id")),
@@ -485,14 +525,43 @@ export async function onRequest(ctx) {
       if (body.action === "remove") { const z = sizes.find(x => x.id === +body.id); if (!z) return E2("not found", 404);
         if ((await hs.list("boxes", { bag_size_id: z.id }, "id", 1)).length) return E2("this bag size is used by a box; edit it instead", 409);
         await hs.batch([hs.delStmt("bag_sizes", { id: z.id })]); return J2({ ok: true, sizes: await hs.list("bag_sizes", {}, "id") }); }
-      if (!name || !(g > 0 || v > 0)) return E2("Give the bag size a name and a gram or cm³ limit.");
+      if (!name || !(g > 0 || v > 0)) return E2("Give the bag size a name and a weight (oz) or volume (cu in) limit.");
       if (body.action === "edit") { const z = sizes.find(x => x.id === +body.id); if (!z) return E2("not found", 404); Object.assign(z, { name, max_g: g, max_cm3: v }); await hs.put("bag_sizes", z); }
       else await hs.put("bag_sizes", { id: Math.max(0, ...sizes.map(x => x.id)) + 1, name, max_g: g, max_cm3: v });
       return J2({ ok: true, sizes: await hs.list("bag_sizes", {}, "id") }); }
     // ---- batch prep (admin, before the sorter leaves): N boxes, each = 1 master QR (box barcode) + M bag QRs (bag 1..M), printed as one sheet
+    // pre-labeled bag supply: admins print a sheet of permanent bag QRs (no box); the sorter's scan gives each its number in a box
+    if (path === "host/bag-labels" && M === "POST") {
+      const n = Math.min(200, Math.max(1, Math.floor(+body.count) || 0)); if (!(+body.count >= 1)) return E2("how many bag labels?");
+      const seq = await hs.nextIds("baglabel", n), ids = await hs.nextIds("bag", n), st = [], codes = [];
+      for (let k = 0; k < n; k++) { const code = R.labelCode(seq[k]); if (await R.qr(code)) return E2("label number clash; try again", 409); codes.push(code);
+        st.push(hs.putStmt("qrcodes", { code, session_id: null, user_id: null, created: now(), expires: Date.now() + LABEL_TTL, status: "issued" }),
+          hs.putStmt("bags", { id: ids[k], code, host_id: host.id, session_id: null, user_id: null, part: "", name: "", color: 0, qty: 0, box_id: null, location: "", status: "labelled", promoted_at: null, picked_at: null, created: now() })); }
+      for (let i = 0; i < st.length; i += 80) await hs.batch(st.slice(i, i + 80)); await hs.staleTotals();
+      return J2({ ok: true, from: seq[0], to: seq[n - 1], labels: codes });
+    }
+    if (path === "host/bag-labels" && M === "GET") {   // reprint a range (?from=1&to=40) or list the free supply
+      const f = Math.floor(+url.searchParams.get("from")), t = Math.floor(+url.searchParams.get("to"));
+      if (f >= 1 && t >= f) { const codes = []; for (let k = f; k <= Math.min(t, f + 199); k++) codes.push(R.labelCode(k));
+        const have = new Map((await hs.list("bags", { code: codes })).map(b => [b.code, b])); return J2({ from: f, to: t, labels: codes.filter(c => have.has(c)) }); }
+      const free = (await hs.list("bags", { box_id: null, session_id: null, status: "labelled", code: { prefix: R.labelCode(0).slice(0, 4) } }, "id")).filter(b => !b.trace);
+      return J2({ free: free.length, labels: free.slice(0, 200).map(b => b.code) });
+    }
+    // admin bag lookup: any bag QR -> its box, number, sorter, dates and contents; mark it missing / moved (or clear that)
+    if ((m = path.match(/^host\/bag\/([\w-]+)$/))) {
+      const b = await R.bag(m[1]); if (!b) return E2(`${m[1].toUpperCase()}: not a bag QR of this host`, 404);
+      if (M === "POST") { const a = body.action;
+        if (!["missing", "moved", "clear"].includes(a)) return E2("action: missing, moved or clear");
+        const note = String(body.note || "").trim().slice(0, 120); if (a === "moved" && !note) return E2("where is it now? add a note");
+        Object.assign(b, a === "clear" ? { trace: null, trace_note: null, trace_at: null } : { trace: a, trace_note: note || null, trace_at: now() });
+        await hs.update("bags", { id: b.id }, { trace: b.trace, trace_note: b.trace_note, trace_at: b.trace_at }); }
+      const bo = await R.bagOut(b), box = b.box_id ? await hs.get("boxes", { id: b.box_id }) : null, who = b.user_id ? await hs.get("users", { id: b.user_id }) : null;
+      return J2({ bag: { ...bo, sorter: who?.username || null, box: box ? { id: box.id, barcode: box.barcode, shelf: box.shelf || "", closed_at: box.closed_at || null } : null,
+        state: b.trace || (b.sealed_at || b.status === "bagged" ? "sealed" : b.box_n ? "filling" : "unused") }, msg: M === "POST" ? "Saved." : null });
+    }
     if (path === "host/batch" && M === "POST") {
-      const nb = Math.min(20, Math.max(1, +body.boxes || 1)), nq = Math.min(30, Math.max(1, +body.bags || 1)), shelf = String(body.shelf || "").trim().toUpperCase().slice(0, 24), made = [];
-      const wg = body.weight_g === undefined || body.weight_g === "" || body.weight_g === null ? null : +body.weight_g; if (wg !== null && !(wg > 0 && wg < 1e6)) return E2("batch weight (g) looks wrong");
+      const nb = Math.min(20, Math.max(1, +body.boxes || 1)), nq = 0, shelf = String(body.shelf || "").trim().toUpperCase().slice(0, 24), made = [];
+      const wg = body.weight_g === undefined || body.weight_g === "" || body.weight_g === null ? null : +body.weight_g; if (wg !== null && !(wg > 0 && wg < 1e6)) return E2("batch weight looks wrong");
       let sizeId = null; if (body.bag_size_id) { const z = await hs.get("bag_sizes", { id: +body.bag_size_id }); if (!z) return E2("no such bag size"); sizeId = z.id; }
       let sorterId = null; if (body.sorter) { const su = await hs.get("users", { username: String(body.sorter).trim().toLowerCase() }); if (!su) return E2("no such sorter on this host"); sorterId = su.id; }
       let n = (await hs.count("boxes")).n + 1;

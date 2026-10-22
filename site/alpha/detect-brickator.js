@@ -7,7 +7,14 @@ window.PTSBrickator = (() => {
   function load() { if (!ready) ready = (async () => { const t = performance.now();
       if (!window.ort) await script("/alpha/vendor/ort/ort.wasm.min.js?v=1");
       ort.env.wasm.wasmPaths = "/alpha/vendor/ort/"; ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
-      const buf = await (await fetch(MODEL)).arrayBuffer();
+      // first time only: model + engine (~26 MB) with progress; afterwards both come from the browser cache (immutable headers)
+      const WASM = "/alpha/vendor/ort/ort-wasm-simd-threaded.wasm?v=1", sizes = { [MODEL]: 12.5e6, [WASM]: 14.3e6 }, got = {};
+      const tell = () => { const t = Object.values(sizes).reduce((a, b) => a + b, 0), g = Object.values(got).reduce((a, b) => a + b, 0); try { API.onprogress && API.onprogress(Math.min(g, t), t); } catch (e) {} };
+      const pull = async url => { const r = await fetch(url); if (!r.ok) throw new Error("could not load " + url); const n = +r.headers.get("content-length"); if (n) sizes[url] = n;
+        if (!r.body || !r.body.getReader) { const b = await r.arrayBuffer(); got[url] = b.byteLength; tell(); return b; }
+        const rd = r.body.getReader(), parts = []; let k = 0; for (;;) { const { done, value } = await rd.read(); if (done) break; parts.push(value); k += value.length; got[url] = k; tell(); }
+        const out = new Uint8Array(k); let o = 0; for (const c of parts) { out.set(c, o); o += c.length; } return out.buffer; };
+      const [buf, wbin] = await Promise.all([pull(MODEL), pull(WASM).catch(() => null)]); if (wbin) ort.env.wasm.wasmBinary = wbin;   // engine bytes handed over: no second download
       const sess = await ort.InferenceSession.create(buf, { executionProviders: ["wasm"], graphOptimizationLevel: "all" });
       stats.load_ms = Math.round(performance.now() - t); return sess; })().catch(e => { ready = null; throw e; });
     return ready; }
@@ -49,5 +56,5 @@ window.PTSBrickator = (() => {
       // color: same as boxes the sorter draws (part pixels of the crop -> estimateColor in the app)
       return { box: [X0, Y0, X1, Y1], crop: k.toDataURL("image/jpeg", 0.9), lab: PTSDetect.cropLab(k), group: null, merged: null, score: Math.round(d.s * 1000) / 1000 }; });
     stats.post_ms = Math.round(performance.now() - t); stats.boxes = parts.length; return parts; }
-  return { VER, load, detect, stats, paperMask };
+  const API = { VER, load, detect, stats, paperMask, onprogress: null }; return API;
 })();

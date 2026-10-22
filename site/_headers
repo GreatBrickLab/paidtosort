@@ -2,3 +2,7 @@
   X-Robots-Tag: noindex, nofollow
 /alpha
   X-Robots-Tag: noindex, nofollow
+/alpha/vendor/*
+  Cache-Control: public, max-age=31536000, immutable
+/alpha/models/*
+  Cache-Control: public, max-age=31536000, immutable

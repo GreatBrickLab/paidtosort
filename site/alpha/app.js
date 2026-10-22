@@ -6,10 +6,20 @@ const img = (p, c) => `https://img.bricklink.com/ItemImage/PN/${+c || 0}/${encod
 let ME = null, PAL = null, PALBY = {};
 let Q = Promise.resolve(); // serialize writes
 async function api(path, body, method) {
-  const run = async () => { const r = await fetch("/alpha/api/" + path, { method: method || (body ? "POST" : "GET"), headers: body ? { "content-type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined, credentials: "same-origin" });
+  const run = async () => { let r; try { r = await fetch("/alpha/api/" + path, { method: method || (body ? "POST" : "GET"), headers: body ? { "content-type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined, credentials: "same-origin" }); }
+    catch (e) { NET.down(); return { error: "No connection: nothing was saved. Check your signal and try again.", offline: true, _status: 0 }; } NET.up();
     const j = await r.json().catch(() => ({ error: "bad response" })); if (r.status === 401 && path !== "login") { ME = null; location.hash = "#/login"; } return Object.assign(j, { _status: r.status }); };
-  if (body) { const p = Q.then(run); Q = p.catch(() => {}); return p; } return run();
+  if (body) { const b = BUSY.claim(); const p = Q.then(run); Q = p.catch(() => {}); if (b) p.finally(() => BUSY.release(b)); return p; } return run();
 }
+// network state: a banner while offline; a scan that failed offline is kept and retried once the phone is back online
+const NET = (() => { let bar = null, retry = null; const show = on => { if (on && !bar) { bar = document.createElement("div"); bar.id = "netbar"; bar.setAttribute("role", "alert"); bar.textContent = "Offline: changes are not saved until you are back online."; document.body.appendChild(bar); } else if (!on && bar) { bar.remove(); bar = null; } };
+  addEventListener("offline", () => show(true)); addEventListener("online", () => { show(false); const f = retry; retry = null; if (f) f(); }); if (navigator.onLine === false) setTimeout(() => show(true));
+  return { down: () => show(true), up: () => { if (navigator.onLine !== false) show(false); }, retryOnline: f => { retry = f; } }; })();
+// double-submit guard: the button (or form submit button) the sorter just pressed stays disabled until its POST answers; +/- quantity steppers are exempt
+const BUSY = (() => { let last = null, at = 0; const mark = b => { if (b && !b.matches(".qbtn")) { last = b; at = Date.now(); } };
+  document.addEventListener("click", e => mark(e.target.closest("button, .btn")), true); document.addEventListener("submit", e => mark(e.submitter || e.target.querySelector("button")), true);
+  return { claim: () => { const b = last && Date.now() - at < 1500 && last.isConnected && last.tagName === "BUTTON" ? last : null; last = null; if (b) { b.disabled = true; b.setAttribute("aria-busy", "true"); } return b; },
+    release: b => { b.disabled = false; b.removeAttribute("aria-busy"); } }; })();
 async function palette() { if (!PAL) { PAL = await (await fetch("/alpha/data/palette.json")).json(); PAL.forEach(c => PALBY[c.id] = c); } return PAL; }
 const SHARDS = {};
 function candidates(p) { const c = [p]; let m = p.match(/^(\d+[a-z]?)(pb|pr|pat)\d+/); if (m) c.push(m[1]); if (/^\d+[a-z]$/.test(p)) c.push(p.slice(0, -1)); if (/^\d+$/.test(p)) c.push(p + "b", p + "a"); return c; }
@@ -30,22 +40,33 @@ function moldDiff(curName, varName) { const a = toks(curName), b = toks(varName)
   const head = plus.length ? plus.join(", ") + (oneW.length ? ` (not ${oneW.join(", ")})` : "") : oneW.map(x => "no " + x).join(", ");
   return [head, multi.length ? "no " + multi.join(", ") : ""].filter(Boolean).join(" · ") || "same name, different mold"; }
 const cname = id => PALBY[id]?.name || String(id), crgb = id => PALBY[id]?.rgb || "888888";
-function toast(t, ms = 2200) { const d = document.createElement("div"); d.className = "toast"; d.textContent = t; document.body.appendChild(d); setTimeout(() => d.remove(), ms); }
+function toast(t, ms = 2200) { $$(".toast:not(.undo)").forEach(x => x.remove()); const d = document.createElement("div"); d.setAttribute("role", "status"); d.className = "toast"; d.textContent = t; document.body.appendChild(d); setTimeout(() => d.remove(), ms); }
 const qrURL = code => { const q = qrcode(0, "M"); q.addData(code); q.make(); return q.createDataURL(6, 2); };
 const barSVG = code => { const s = document.createElementNS("http://www.w3.org/2000/svg", "svg"); JsBarcode(s, code, { format: "CODE128", height: 60, fontSize: 14, margin: 4 }); return s.outerHTML; };
+// server times are UTC ("YYYY-MM-DD HH:MM:SS"); show them in the host's local time (America/Chicago)
+const ctime = t => { if (!t) return "–"; const d = new Date(String(t).replace(" ", "T") + (/[zZ]|[+-]\d\d:?\d\d$/.test(t) ? "" : "Z")); return isNaN(d) ? String(t) : d.toLocaleString("en-US", { timeZone: "America/Chicago", month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }) + " CT"; };
+// units: grams / cm³ are stored; everything shown or typed is US: oz under 1 lb, then lb (2 decimals); volume in cu in
+const G_OZ = 28.349523125, CM3_IN3 = 16.387064, DENS = CM3_IN3 / G_OZ;   // 1 g/cm³ = 0.578 oz/cu in
+const ozOf = g => (+g || 0) / G_OZ, cuinOf = c => (+c || 0) / CM3_IN3;
+const fmtW = g => { const oz = ozOf(g); return oz >= 16 ? `${(oz / 16).toFixed(2)} lb` : `${oz < 1 && oz > 0 ? oz.toFixed(2) : oz.toFixed(1)} oz`; };
+const fmtV = c => { const v = cuinOf(c); return `${v < 1 && v > 0 ? v.toFixed(2) : v.toFixed(1)} cu in`; };
+const num = (v, d = 1) => (Math.round(v * 10 ** d) / 10 ** d).toString();
+const toMetric = o => { const r = { ...o }, mv = (k, nk, f) => { if (k in r) { r[nk] = r[k] === "" || r[k] === null ? r[k] : Math.round(+r[k] * f * 100) / 100; delete r[k]; } };
+  mv("max_oz", "max_g", G_OZ); mv("max_cuin", "max_cm3", CM3_IN3); mv("bag_max_oz", "bag_max_g", G_OZ); mv("bag_max_cuin", "bag_max_cm3", CM3_IN3); mv("batch_lb", "weight_g", 16 * G_OZ);
+  if ("density_oz_cuin" in r) { r.loose_density = Math.round(+r.density_oz_cuin / DENS * 1000) / 1000; delete r.density_oz_cuin; } return r; };
 const pill = (t, cls) => `<span class="pill ${esc(cls || t)}">${esc(t)}</span>`;
 
 // ---------------- scanning: camera QR for box, bag and lookup fields
 // BarcodeDetector where the browser has it (Android Chrome); everywhere else (iPhone Safari, desktop) jsQR, vendored and loaded on first use.
 // Needs HTTPS + a tap (user gesture) for the camera; errors are shown instead of failing silently.
-let JSQR = null; const loadJsQR = () => JSQR || (JSQR = new Promise((ok, no) => { if (window.jsQR) return ok(window.jsQR); const s = document.createElement("script"); s.src = "/alpha/vendor/jsQR.js?v=1"; s.onload = () => ok(window.jsQR); s.onerror = () => { JSQR = null; no(new Error("QR reader failed to load")); }; document.head.appendChild(s); }));
+let JSQR = null; const loadJsQR = () => JSQR || (JSQR = new Promise((ok, no) => { if (window.jsQR) return ok(window.jsQR); const s = document.createElement("script"); s.src = "/alpha/vendor/jsQR.min.js?v=1"; s.onload = () => ok(window.jsQR); s.onerror = () => { JSQR = null; no(new Error("QR reader failed to load")); }; document.head.appendChild(s); }));
 async function qrDecoder() {
   if ("BarcodeDetector" in window) try { const f = await BarcodeDetector.getSupportedFormats(); if (f.includes("qr_code")) { const d = new BarcodeDetector({ formats: f.filter(x => ["qr_code", "code_128"].includes(x)) }); return async v => (await d.detect(v))[0]?.rawValue || null; } } catch (e) {}
   const jsQR = await loadJsQR(), c = document.createElement("canvas"), g = c.getContext("2d", { willReadFrequently: true });
   return async v => { const w = v.videoWidth, h = v.videoHeight; if (!w || !h) return null; const k = Math.min(1, 720 / Math.max(w, h)); c.width = Math.round(w * k); c.height = Math.round(h * k);
     g.drawImage(v, 0, 0, c.width, c.height); const r = jsQR(g.getImageData(0, 0, c.width, c.height).data, c.width, c.height, { inversionAttempts: "dontInvert" }); return r?.data || null; };
 }
-const camErr = e => e?.name === "NotAllowedError" ? "Camera blocked: allow camera access for this site (Settings › Safari › Camera on iPhone), or type the code." : e?.name === "NotFoundError" ? "No camera found: type the code instead." : e?.name === "NotReadableError" ? "The camera is busy in another app." : (e?.message || "Camera failed") + ": type the code instead.";
+const camErr = e => e?.name === "NotAllowedError" ? (/android/i.test(navigator.userAgent) ? "Camera blocked: tap the lock icon next to the address, then Permissions › Camera › Allow, or type the code." : /iphone|ipad/i.test(navigator.userAgent) ? "Camera blocked: allow camera access for this site (Settings › Safari › Camera), or type the code." : "Camera blocked: allow camera access for this site in your browser’s site settings, or type the code.") : e?.name === "NotFoundError" ? "No camera found: type the code instead." : e?.name === "NotReadableError" ? "The camera is busy in another app." : (e?.message || "Camera failed") + ": type the code instead.";
 let SCAN_STOP = null;   // one camera at a time; re-rendered screens stop the old stream
 function attachScan(btn, vid, onCode) { if (!btn || !vid) return;
   if (!navigator.mediaDevices?.getUserMedia || !window.isSecureContext) return;   // no camera API (or plain http): typing still works
@@ -62,10 +83,10 @@ function attachScan(btn, vid, onCode) { if (!btn || !vid) return;
 
 // ---------------- views
 const CS_HTML = `<dialog id="cs" class="sheet"><div class="card"><div class="cshead"><h3>Color for <span id="cs_part" class="mono"></span></h3><button type="button" class="btn ghost small" id="cs_x">✕</button></div>
-  <input id="cs_q" type="search" enterkeyhint="done" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Type to search colors" autocomplete="off">
+  <input id="cs_q" aria-label="Search colors" type="search" enterkeyhint="done" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Type to search colors" autocomplete="off">
   <div id="cs_body"></div><label class="small tick" style="margin-top:8px"><input type="checkbox" id="cs_all" style="width:auto;display:inline"> Show all colors</label></div></dialog>`;
 const V = {}; let FIRST = true, SESS_OPEN = false; const LASTK = () => "pts_last_sid:" + (ME?.host?.id ?? "") + ":" + (ME?.user?.username || "");   // first screen after the app (re)starts: auto-resume the last open session
-V.login = () => { main.innerHTML = `<div class="login"><img src="/alpha/pts-mark.png" class="bigmark" alt="Paid to Sort"><h1>Sign in</h1><p class="muted">Sort parts. Get paid.</p><p class="err" id="err"></p>
+V.login = () => { main.innerHTML = `<div class="login"><img src="/alpha/pts-mark-256.png" class="bigmark" alt="Paid to Sort"><h1>Sign in</h1><p class="muted">Sort parts. Get paid.</p><p class="err" id="err"></p>
   <form class="card" id="lf"><label>Username<input name="username" autocomplete="username" autocapitalize="none" required></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button class="btn gold wide">Sign in</button></form></div>`;
   $("#lf").onsubmit = async e => { e.preventDefault(); const f = new FormData(e.target); const j = await api("login", { username: f.get("username"), password: f.get("password") });
     if (j.ok) { await loadMe(); location.hash = "#/"; } else $("#err").textContent = j.error; }; };
@@ -82,24 +103,25 @@ V.home = async () => { const j = await api("me?stats=1"); ME = j; header();
   $("#start").onclick = async () => { const r = await api("session/start", {}); location.hash = "#/s/" + r.id; }; };
 
 V.session = async (sid) => { await palette(); const j = await api("session/" + sid); if (j.error) { main.innerHTML = `<p class="err">${esc(j.error)}</p>`; return; }
-  const s = j.s, open = s.status === "open"; SESS_OPEN = open; SBAGS = j.bags; SBOX = j.box; METER = j.meter; OPENLOTS = j.open_lots || [];
+  const s = j.s, open = s.status === "open"; SESS_OPEN = open; SBAGS = j.bags; SBOX = j.box; SCUR = j.cur_bag || null; METER = j.meter; OPENLOTS = j.open_lots || [];
   main.innerHTML = `<div class="sess"><div><small class="muted">Session</small><h1 class="mono">${s.id}</h1></div>${pill(s.status)}</div>
-  <p class="muted small">${esc(j.owner)} · started ${s.started.slice(5, 16)} UTC · ${esc(j.pay)}</p>
+  <p class="muted small">${esc(j.owner)} · started ${esc(ctime(s.started))} · ${esc(j.pay)}</p>
+  ${open && !SBOX ? `<div id="openbar">${openBarHTML()}</div>` : ""}
   ${open ? `<div class="card upload"><label class="btn gold wide big" for="cam">📷 Take photo of parts</label><input id="cam" type="file" accept="image/*" capture="environment" hidden>
    <label class="btn wide" for="pick">Upload a photo</label><input id="pick" type="file" accept="image/*" hidden>
    <p class="muted small">Lay parts flat and apart on a plain surface. Parts are found on your phone, then each crop is sent to the identification engine.</p>
    <p class="small trainnote">ⓘ Part photos help improve detection.</p><button type="button" class="btn wide" id="missbtn" hidden>＋ Missed a part?</button>
    <div id="prog" class="prog" hidden><div class="spin"></div><span id="progt">Working…</span></div><canvas id="prev" class="prev" hidden></canvas><div id="review" class="review" hidden></div></div>` : ""}
-  <div id="openbar">${open ? openBarHTML() : ""}</div>
+  ${open && !SBOX ? "" : `<div id="openbar">${open ? openBarHTML() : ""}</div>`}
   <div id="dock" class="dock">${open && SBOX ? `<div id="openbag">${openBagHTML()}</div>` : ""}<div id="photo" hidden></div></div>
-  <h2>Verify <span class="muted small" id="pend">${j.cards.length} to check</span></h2>
-  <p class="muted small">Swipe up on a card’s <b>⇡ bar</b> to confirm it (or tap ✓); scroll anywhere else. Confirmed lots go into the open bag; when it is full, cut it off and scan its bag label.</p>
-  <div id="cards">${j.cards.map(c => cardHTML(c)).join("")}</div>
+  ${open || j.cards.length ? `<h2>Verify <span class="muted small" id="pend">${j.cards.length} to check</span></h2>
+  <p class="muted small" id="verhint"${open && j.cards.length ? "" : " hidden"}>Swipe up on a card’s <b>⇡ bar</b> to confirm it (or tap ✓); scroll anywhere else. Confirmed lots go into the bag you are filling; when it is full, scan the next labeled bag.</p>
+  <div id="cards">${j.cards.map(c => cardHTML(c)).join("")}</div>` : ""}
   <button type="button" class="btn gold wide big" id="confirmall" ${j.cards.length ? "" : "hidden"}>✓ Confirm all <span id="ca_n">${j.cards.length}</span> cards into the open bag</button>
   ${summaryHTML(j.summary, !open)}
   <h2>Sealed bags <span class="muted small">${j.bags.filter(b => (b.lots || []).length).length}</span></h2>
-  <div id="bags" class="flatlist baglist">${[...j.bags].filter(b => (b.lots || []).length).reverse().map((b, i, a) => bagHTML(b, { n: i + 1, open: b.open || (!a.some(x => x.open) && i === a.length - 1) })).join("")}</div><p class="muted small" id="swipehint" ${j.bags.length ? "" : "hidden"}>Tap a bag to show its parts. Swipe a part <b>left</b> to edit it or remove it from the bag.</p>
-  ${open ? `<form class="card" id="endf"><h3>Batch done</h3><p class="muted small">Seal the last open bag first (scan its label). Then finish to see the batch summary.</p>${ME.host.pay_mode === "lb" ? `<label>Weight sorted (lb)<input name="w" type="number" step="0.01" min="0" inputmode="decimal"></label>` : ""}<button class="btn wide">Batch done · show summary</button></form>` : ""}
+  <div id="bags" class="flatlist baglist">${[...j.bags].filter(b => (b.lots || []).length).reverse().map(b => open ? b : { ...b, open: false }).map((b, i, a) => bagHTML(b, { n: i + 1, open: open && (b.open || (!a.some(x => x.open) && i === a.length - 1)) })).join("")}</div><p class="muted small" id="swipehint" ${j.bags.length ? "" : "hidden"}>Tap a bag to show its parts.${open ? " Swipe a part <b>left</b> to edit it or remove it from the bag." : ""}</p>
+  ${open ? `<form class="card" id="endf"><h3>Batch done</h3><p class="muted small">Finishing seals the bag you are filling. Then you see the batch summary.</p>${ME.host.pay_mode === "lb" ? `<label>Weight sorted (lb)<input name="w" type="number" step="0.01" min="0" inputmode="decimal"></label>` : ""}<button class="btn wide">Batch done · show summary</button></form>` : ""}
 ${CS_HTML}`;
   if (open) { ["#cam", "#pick"].forEach(id => $(id).onchange = e => processPhoto(sid, e.target.files[0]));
    
@@ -169,18 +191,24 @@ const lotHTML = l => `<div class="lot" data-lot="${l.id}"><div class="lacts"><bu
 let SBAGS = [];
 const bagNo = b => { if (!b.box_id && b.box_id !== 0) return null; const same = SBAGS.filter(x => x.box_id === b.box_id).sort((a, c) => a.id - c.id); return same.findIndex(x => x.code === b.code) + 1 || null; };
 // box at the start (master QR from the batch-prep sheet); after that, every bag QR scanned seals the open bag into that bag
-let SBOX = null, METER = null, OPENLOTS = [];
-const openBarHTML = () => `<div class="card openbar boxpanel"><div class="obtxt">${SBOX ? `<b>Box ${esc(SBOX.barcode)}</b> · photos and confirmed parts go into the <b>open bag</b>. Scan a bag label of this box to seal it.` : `<b>Scan the box’s master QR to start</b>`}</div>
-  <div class="scanrow"><input id="bxscan" placeholder="${SBOX ? "Scan or type a bag label to seal the open bag" : "Scan or type the box master QR"}" autocapitalize="characters" autocomplete="off"><button type="button" class="btn small gold" id="bxgo">Go</button><button type="button" class="btn small" id="bxcam" hidden>📷 Scan</button></div><video id="bxvid" class="scanvid" hidden playsinline muted></video></div>`;
+let SBOX = null, SCUR = null, METER = null, OPENLOTS = [];
+// put-away grid location "A-03-2" -> Shelf A · Row 03 · Col 2 (anything else is shown as typed)
+const gridLoc = v => { const m = String(v || "").match(/^([A-Z0-9]+)-(\d+)-(\d+)$/); return m ? `Shelf ${m[1]} · Row ${m[2]} · Col ${m[3]}` : String(v || ""); };
+const openBarHTML = () => `<div class="card openbar boxpanel"><div class="obtxt">${!SBOX ? `<b>Scan the box’s master QR to start</b>` : `<b>Box ${esc(SBOX.barcode)}</b>${SBOX.shelf ? ` · <span class="small">${esc(gridLoc(SBOX.shelf))}</span>` : ""}<br>${SCUR ? `Filling <b class="curbag">Bag ${SCUR.n}</b> <span class="mono small muted">${esc(SCUR.code)}</span>. When it is full, scan the next labeled bag: that seals this one.` : `Scan a labeled bag to start <b>Bag ${(SBAGS.filter(b => b.box_id === SBOX.id).reduce((a, b) => Math.max(a, b.n || 0), 0)) + 1}</b>.`}`}</div>
+  <label for="bxscan" class="sr">${SBOX ? "Bag label code" : "Box master QR code"}</label><div class="scanrow"><input id="bxscan" placeholder="${SBOX ? "Scan or type the next bag label" : "Scan or type the box master QR"}" autocapitalize="characters" autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="go"><button type="button" class="btn small" id="bxcam" aria-label="Scan with camera" hidden>📷 Scan</button></div><video id="bxvid" class="scanvid" hidden playsinline muted></video>
+  ${SBOX ? `<button type="button" class="btn small ghost wide" id="boxfull">📦 Box full · close box ${esc(SBOX.barcode)}</button>` : ""}</div>`;
+// big centred notice (write the number on the bag, used label, box closed): stays until the sorter taps OK
+function bigNote(html, cls = "") { const d = document.createElement("dialog"); d.className = "bignote " + cls; d.innerHTML = `<div class="card center">${html}<button class="btn gold wide" id="bnok">OK</button></div>`;
+  document.body.appendChild(d); d.showModal(); d.querySelector("#bnok").onclick = () => { d.close(); d.remove(); }; return d; }
 const fmt$ = v => "$" + (+v || 0).toFixed(2);
 // open-bag meter: compact strip so the photo and cards stay on screen. Bar = whichever cap (weight or volume) is closer to full.
 const meterHTML = m => { if (!m) return ""; const pw = m.max_g ? Math.min(100, Math.round(100 * m.weight_g / m.max_g)) : 0, ap = m.approx ? "≈ " : "";
   const pv = m.max_cm3 ? Math.min(100, Math.round(100 * m.volume_cm3 / m.max_cm3)) : 0, lead = pv > pw ? "volume" : "weight", pct = Math.max(pw, pv);
   const apx = m.approx || m.no_size ? [m.no_weight ? `${m.no_weight} lot${m.no_weight === 1 ? "" : "s"} without weight data` : "", m.no_size ? `${m.no_size} without size data` : "", m.no_price ? `${m.no_price} without price data` : ""].filter(Boolean).join(", ") : "";
   return `<div class="meter mini${m.full ? " full" : ""}${pct >= 85 && !m.full ? " near" : ""}" id="meter">
-  <div class="mrow"><span class="mc"><b id="m_g">${ap}${m.weight_g}</b><small>/${m.max_g || "–"} g</small></span><span class="mc"><b id="m_v">≈${m.volume_cm3}</b><small>/${m.max_cm3 || "–"} cm³</small></span><span class="mc"><b id="m_n">${m.pcs}</b><small>pcs</small></span><span class="mc"><b id="m_e">${ap}${m.earnings !== null ? fmt$(m.earnings) : fmt$(m.value)}</b><small>est.</small></span></div>
+  <div class="mrow"><span class="mc"><b id="m_g">${ap}${num(ozOf(m.weight_g), ozOf(m.weight_g) < 1 ? 2 : 1)}</b><small>/${m.max_g ? num(ozOf(m.max_g)) : "–"} oz</small></span><span class="mc"><b id="m_v">≈${num(cuinOf(m.volume_cm3))}</b><small>/${m.max_cm3 ? num(cuinOf(m.max_cm3)) : "–"} cu in</small></span><span class="mc"><b id="m_n">${m.pcs}</b><small>pcs</small></span><span class="mc"><b id="m_e">${ap}${m.earnings !== null ? fmt$(m.earnings) : fmt$(m.value)}</b><small>est.</small></span></div>
   <div class="mbar2" title="${lead} ${pct}%"><i style="width:${pct}%"></i></div><div class="mlbl small"><span>${m.bag_size ? `${esc(m.bag_size)} bag · ` : ""}${pct}% full by ${lead}</span>${apx ? `<span class="mflag" id="m_ap" title="Approximate: ${esc(apx)}">⚑ approx.</span>` : ""}</div>
-  ${m.full ? `<div class="bagfull" id="bagfull" role="status"><div><b>Bag looks full: cut it off and scan its label</b><div class="small" id="fullby">${m.full_by === "volume" ? `Volume limit reached (≈ ${m.volume_cm3} of ${m.max_cm3} cm³)` : m.full_by === "weight" ? `Weight limit reached (${m.weight_g} of ${m.max_g} g)` : `Weight and volume limits reached`}</div></div><button type="button" class="btn small sealgo">📷 Scan bag label</button></div>` : ""}</div>`; };
+  ${m.full ? `<div class="bagfull" id="bagfull" role="status"><div><b>Bag looks full: scan the next labeled bag to seal it</b><div class="small" id="fullby">${m.full_by === "volume" ? `Volume limit reached (≈ ${fmtV(m.volume_cm3)} of ${fmtV(m.max_cm3)})` : m.full_by === "weight" ? `Weight limit reached (${fmtW(m.weight_g)} of ${fmtW(m.max_g)})` : `Weight and volume limits reached`}</div></div><button type="button" class="btn small sealgo">📷 Scan next bag</button></div>` : ""}</div>`; };
 // lot row thumbnail: matched part image; if it cannot load, the sorter's crop; if neither, a neutral tile
 const lotThumb = l => `<img src="${img(l.part, l.color)}" class="thumb" alt="" onerror="${l.crop ? `if(this.dataset.f){this.style.visibility='hidden'}else{this.dataset.f=1;this.src='${esc(l.crop)}'}` : "this.style.visibility='hidden'"}">`;
 const openLotHTML = l => `<div class="olot row" data-lot="${l.id}">${lotThumb(l)}<span class="grow"><span class="mono">${esc(l.part)}</span> · ${esc(l.color_name || cname(l.color))}<br><span class="small muted">${esc((l.name || "").slice(0, 40))}</span></span>
@@ -190,7 +218,7 @@ const openBagHTML = () => `<div class="card openbagc"><details class="obd"${OB_O
   ${METER && (METER.approx || METER.no_size) ? `<p class="small muted">Approximate: ${[METER.no_weight ? `${METER.no_weight} lot${METER.no_weight === 1 ? "" : "s"} without weight data` : "", METER.no_size ? `${METER.no_size} without size data` : "", METER.no_price ? `${METER.no_price} without price data` : ""].filter(Boolean).join(", ")}. Value is ${METER.earnings !== null ? "your estimated earnings" : "the estimated parts value"}.</p>` : ""}
   <div class="olots">${OPENLOTS.map(openLotHTML).join("") || `<p class="muted small">Empty. Confirm parts to fill it.</p>`}</div></details></div>`;
 function setOpenBag(j) { if (j.meter) METER = j.meter; if (j.open_lots) OPENLOTS = j.open_lots; const ob = $("#openbag"); if (!ob) return; const was = METER && $("#bagfull");
-  ob.innerHTML = openBagHTML(); wireOpenBag(); PH.fit(); if (METER?.full && !was) toast("Bag looks full: cut it off and scan its label", 4000); }
+  ob.innerHTML = openBagHTML(); wireOpenBag(); PH.fit(); if (METER?.full && !was) toast("Bag looks full: scan the next labeled bag to seal it", 4000); }
 function wireOpenBag() { const d = $("#openbag .obd"); if (d) { d.ontoggle = () => { OB_OPEN = d.open; PH.fit(); };
     d.querySelector(".sealgo")?.addEventListener("click", e => { e.preventDefault(); e.stopPropagation(); const i = $("#bxscan"); if (!i) return; $("#openbar").scrollIntoView({ block: "start" }); scrollBy(0, -56); i.focus({ preventScroll: true }); const cam = $("#bxcam"); if (cam && !cam.hidden) cam.click(); }); }
   $$("#openbag .olot").forEach(el => { const id = el.dataset.lot, l = OPENLOTS.find(x => x.id === +id);
@@ -199,14 +227,25 @@ function wireOpenBag() { const d = $("#openbag .obd"); if (d) { d.ontoggle = () 
   el.querySelector(".orm").onclick = async () => { const j = await api("lot/" + id, { action: "remove" }); if (!j.ok) return toast(j.error || "failed"); setOpenBag(j);
     undoBar(`Removed ${l.part} from the open bag`, async () => { const r = await api("lot/" + id, { action: "restore" }); if (r.ok) setOpenBag(r); }); }; }); }
 const summaryHTML = (t, show) => { if (!t || !show) return ""; const ap = t.approx ? "≈ " : "";
-  return `<div class="card summary" id="summary"><h3>Batch summary</h3><div class="stat"><div><b>${t.bags}</b><span>bags</span></div><div><b>${ap}${t.weight_g} g</b><span>sorted weight${t.batch_weight_g ? ` vs ${t.batch_weight_g} g prepped` : ""}</span></div>
+  return `<div class="card summary" id="summary"><h3>Batch summary</h3><div class="stat"><div><b>${t.bags}</b><span>bags</span></div><div><b>${ap}${fmtW(t.weight_g)}</b><span>sorted weight${t.batch_weight_g ? ` vs ${fmtW(t.batch_weight_g)} prepped` : ""}</span></div>
   <div><b>${ap}${t.earnings !== null ? fmt$(t.earnings) : fmt$(t.value)}</b><span>${t.earnings !== null ? "estimated earnings" : "estimated parts value"}</span></div></div>
   ${t.batch_weight_g ? `<p class="small muted">${Math.round(100 * t.weight_g / t.batch_weight_g)}% of the prepped batch weight is accounted for in sealed bags.</p>` : ""}
-  ${t.per_bag.map(b => `<div class="row small sumrow"><b>Bag ${b.n || "?"}</b><span class="mono muted">${esc(b.code)}</span><span class="grow">${b.pcs} pcs · ${b.approx ? "≈ " : ""}${b.weight_g} g · ${fmt$(b.value)}</span></div>`).join("")}</div>`; };
+  ${[...t.per_bag].sort((a, b) => (a.n || 0) - (b.n || 0)).map(b => `<div class="row small sumrow"><b>Bag ${b.n || "?"}</b><span class="mono muted">${esc(b.code)}</span><span class="grow">${b.pcs} pcs · ${b.approx ? "≈ " : ""}${fmtW(b.weight_g)} · ${fmt$(b.value)}</span></div>`).join("")}</div>`; };
 function wireOpenBar() { const ob = $("#openbar .openbar"); if (!ob) return; const sid = location.hash.match(/#\/s\/([\w-]+)/)?.[1];
-  const go = async code => { code = String(code || "").trim(); if (!code) return; const j = await api(`session/${sid}/scan`, { code }); if (!j.ok) return toast(j.error || "failed", 3500);
-    toast(j.sealed ? `Sealed into Bag ${j.sealed.n || ""} (${j.sealed.code}): ${j.sealed.meter.pcs} pcs, ${j.sealed.meter.weight_g} g. New open bag started.` : "Box linked. Photos and parts go into the open bag.", 3500); route(); };
-  $("#bxgo").onclick = () => go($("#bxscan").value); $("#bxscan").onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); go($("#bxscan").value); } };
+  const go = async code => { code = String(code || "").trim(); if (!code) return; const j = await api(`session/${sid}/scan`, { code });
+    if (j.offline) { const i = $("#bxscan"); if (i) i.value = code; NET.retryOnline(() => { if ($("#bxscan")) go(code); }); return toast("No connection: the scan is kept and will be retried when you are back online.", 5000); }
+    if (j.in_use) return bigNote(`<div class="bn-ico">📱</div><h2>Box in use on another phone</h2><p>${esc(j.error)}</p><p class="small muted">One box is sorted on one phone at a time. Finish or close that session first, or scan a different box.</p>`, "warn");
+    if (j.retired) return bigNote(`<div class="bn-ico">🚫</div><h2>Retired label, use a GBL labeled bag</h2><p class="small muted mono">${esc(code.toUpperCase())}</p><p>${esc(j.error)}</p>`, "warn");
+    if (j.closed_box) { const d = bigNote(`<div class="bn-ico">📦</div><h2>Box ${esc(j.closed_box.barcode)} is closed</h2><p>It was closed as full${j.closed_box.bags ? ` with ${j.closed_box.bags} bag${j.closed_box.bags === 1 ? "" : "s"}` : ""}. Reopen it to keep filling it; bag numbers continue.</p><button class="btn wide" id="reopenbx">↩ Reopen box</button>`, "warn");
+      d.querySelector("#reopenbx").onclick = async () => { const r = await api("box/" + j.closed_box.id, { action: "reopen" }); if (r.error) return toast(r.error); d.close(); d.remove(); go(code); }; return; }
+    if (!j.ok) return j.used ? bigNote(`<div class="bn-ico">⚠️</div><h2>Already used</h2><p>${esc(j.error)}</p>`, "warn") : toast(j.error || "failed", 3500);
+    await route();
+    if (j.bag) bigNote(`${j.sealed ? `<p class="small okmsg">Sealed Bag ${j.sealed.n}: ${j.sealed.meter.pcs} pcs, ${fmtW(j.sealed.meter.weight_g)}</p>` : ""}<div class="small muted">Box ${esc(j.bag.box_code)} · <span class="mono">${esc(j.bag.code)}</span></div><div class="bn-big">Write <b>${j.bag.n}</b> on this bag</div><p class="small muted">Photos and confirmed parts now go into Bag ${j.bag.n}.</p>`);
+    else toast("Box linked. Scan a labeled bag to start Bag 1.", 3500); };
+  $("#boxfull") && ($("#boxfull").onclick = async () => { if (!confirm(`Close Box ${SBOX.barcode} as full?${OPENLOTS.length ? ` Bag ${SCUR?.n || ""} will be sealed.` : ""}`)) return;
+    const j = await api(`session/${sid}/box-full`, {}); if (!j.ok) return toast(j.error || "failed", 3500); await route();
+    bigNote(`<div class="bn-ico">📦</div><h2>Box ${esc(j.closed.code)} closed</h2><p>${j.closed.bags} bag${j.closed.bags === 1 ? "" : "s"}${j.sealed ? ` · Bag ${j.sealed.n} sealed` : ""}.</p>${j.closed.shelf ? `<p>Put it away at</p><div class="bn-loc">${esc(gridLoc(j.closed.shelf))}</div>` : ""}<p class="small muted">Scan a new box to continue; bag numbers start again at 1.</p>`); });
+  $("#bxscan").onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); go($("#bxscan").value); } };
   attachScan($("#bxcam"), $("#bxvid"), go); }
 function updateOpenBar() {}
 const bagHTML = (b, flat) => { const lots = b.lots || [], pcs = lots.reduce((a, l) => a + l.qty, 0);
@@ -262,14 +301,14 @@ function wireBags(root, only) { if (!root) return;
 const ep = el => (el.dataset.lot ? "lot/" : "card/") + el.dataset.id;
 function wireCards(cards, els) { els = els || $$(".pcard:not(.lotedit)");
   const byId = Object.fromEntries(cards.map(c => [c.id, c]));
-  const left = () => { const n = $$(".pcard:not(.lotedit):not(.going):not(.dropping)").length; $("#pend").textContent = n + " to check"; if ($("#ca_n")) { $("#ca_n").textContent = n; $("#confirmall").hidden = !n; } };
+  const left = () => { const n = $$(".pcard:not(.lotedit):not(.going):not(.dropping)").length; $("#pend").textContent = n + " to check"; if ($("#verhint")) $("#verhint").hidden = !n; if ($("#ca_n")) { $("#ca_n").textContent = n; $("#confirmall").hidden = !n; } };
   let bulk = false; const confirmCard = async (el, extra) => { if (el.classList.contains("going")) return; el.classList.add("going"); const j = await api("card/" + el.dataset.id, Object.assign({ action: "confirm", qty: +el.dataset.qty || 1 }, extra || {}));
     if (j.ok) { setOpenBag(j); PH.done(+el.dataset.id, !bulk); setTimeout(() => el.remove(), 260); left(); if (TRAIN_SID) trainSoon(TRAIN_SID); } else { el.classList.remove("going"); toast(j.error || "failed"); } };
   // "Confirm all": every remaining card, with its current color / qty / part, goes into the open bag (in list order)
   const ca = $("#confirmall"); if (ca && !els.some(e => e.classList.contains("lotedit"))) ca.onclick = async () => { ca.disabled = true;
     await new Promise(r => setTimeout(r, 450)); await Q;   // let pending qty saves land first
     const todo = $$(".pcard:not(.lotedit):not(.going):not(.dropping)"); bulk = true; for (const el of todo) await confirmCard(el); bulk = false;
-    ca.disabled = false; left(); toast(METER?.full ? "Bag looks full: cut it off and scan its label" : `Confirmed ${todo.length} card${todo.length === 1 ? "" : "s"} into the open bag`, 3500); };
+    ca.disabled = false; left(); toast(METER?.full ? "Bag looks full: scan the next labeled bag to seal it" : `Confirmed ${todo.length} card${todo.length === 1 ? "" : "s"} into the open bag`, 3500); };
   els.forEach(el => {
     const isLot = el.classList.contains("lotedit");
     if (!isLot) el.querySelector(".ok").onclick = () => confirmCard(el);
@@ -421,7 +460,7 @@ async function processPhoto(sid, file) {
   if (!file) return; const prog = $("#prog"), pt = $("#progt"); prog.hidden = false;
   try {
     // the ONNX part finder is the only detector (onnxruntime-web, model downloaded once and cached by the browser)
-    pt.textContent = "Loading part finder (first time ~15 MB)…";
+    pt.textContent = "Getting the part finder ready…"; PTSBrickator.onprogress = (got, tot) => { pt.textContent = `Getting the part finder ready (first time only): ${Math.round(100 * got / tot)}% of ${Math.round(tot / 1048576)} MB`; };
     const tl = performance.now(); await Promise.all([PTSBrickator.load(), palette()]); const loadMs = Math.round(performance.now() - tl);
     pt.textContent = "Finding parts…";
     const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
@@ -485,7 +524,7 @@ async function finishPhoto(sid, cvs, parts, missed0, resumed, det) {
       const per = {}; for (const b of [...tboxes, ...mboxes]) { const id = cid(b.line); if (id) (per[id] = per[id] || []).push(b.box); } for (const [id, bs] of Object.entries(per)) await ZM.mapCard(+id, pid, bs[0], 1, bs); } catch (e) { console.warn("zoom store", e); }     // training sample: kept on the phone until these cards are resolved, then uploaded in the background; review boxes are labelled 'missed'
     try { const tid = await PTSTrain.begin(sid, cvs, tboxes.map(b => ({ box: b.box.map(v => Math.round(v)), card_id: cid(b.line), pred: b.pred })), det);
       for (const b of mboxes) await PTSTrain.addMissed(tid, b.box.map(v => Math.round(v)), cid(b.line)); } catch (e) { console.warn("training sample", e); }
-    toast(`${total} parts${missed.length ? ` (${missed.length} added by you)` : ""} → ${lines.length} lots${lowN ? ` · ${lowN} to double-check` : ""}${unk ? ` · ${unk} not recognised, retake the photo to try again` : ""}`, 3500); route();
+    toast(`${total} parts${missed.length ? ` (${missed.length} added by you)` : ""} → ${lines.length} lots${lowN ? ` · ${lowN} to double-check` : ""}${unk ? ` · ${unk} not recognised, retake the photo to try again` : ""}`, 3500); Promise.resolve(route()).then(() => setTimeout(() => { const c = $(".pcard"), d = $("#dock"), t = $(".top"); if (c) scrollTo({ top: c.getBoundingClientRect().top + scrollY - (t ? t.offsetHeight : 56) - (d ? d.offsetHeight : 0) - 8, behavior: "smooth" }); }, 350));
   } catch (e) { pt.textContent = "Error: " + e.message; console.error(e); }
 }
 // photo review: keeps the photo on screen with the found boxes (gold); tap or drag to add a box (pink, 'missed'); Done resolves the list of missed boxes
@@ -518,19 +557,20 @@ async function identify(image) { for (let t = 0; t < 2; t++) { try { const r = a
 function shrink(dataURL, max) { return new Promise(res => { const im = new Image(); im.onload = () => { const s = Math.min(1, max / Math.max(im.width, im.height)), c = document.createElement("canvas"); c.width = im.width * s; c.height = im.height * s; c.getContext("2d").drawImage(im, 0, 0, c.width, c.height); res(c.toDataURL("image/jpeg", 0.8)); }; im.src = dataURL; }); }
 
 V.boxes = async () => { const j = await api("boxes");
-  main.innerHTML = `<h1>Boxes</h1><div class="card">${ME?.user.role === "admin" ? `<p class="muted small">New boxes and their bag QR sheets are made in Batch prep.</p><a class="btn gold wide" href="#/host/batch">Open Batch prep</a>` : `<p class="muted small">New boxes and bag QR sheets are made by a host admin in Batch prep.</p>`}<a class="btn wide" href="#/putaway" style="margin-top:8px">Put-away</a></div>
-  ${j.boxes.map(x => `<a class="row card" href="#/box/${x.id}"><span style="max-width:130px">${barSVG(x.barcode).replace("<svg", '<svg class="bc"')}</span><span><b class="mono">${x.barcode}</b><br><span class="muted small">${x.nb} bags · ${x.pcs} pcs</span></span>${pill(x.shelf || "no shelf", "")}</a>`).join("") || `<p class="muted">No boxes yet.</p>`}`; };
+  main.innerHTML = `<h1>Boxes</h1><div class="card">${ME?.user.role === "admin" ? `<p class="muted small">New boxes and their box labels are made in Batch prep; bag labels in Host · Bag labels.</p><a class="btn gold wide" href="#/host/batch">Open Batch prep</a>` : `<p class="muted small">New boxes and labels are made by a host admin.</p>`}<a class="btn wide" href="#/putaway" style="margin-top:8px">Put-away</a></div>
+  ${j.boxes.map(x => `<a class="row card" href="#/box/${x.id}"><span style="max-width:130px">${barSVG(x.barcode).replace("<svg", '<svg class="bc"')}</span><span class="grow"><span class="bxloc">${x.shelf ? esc(gridLoc(x.shelf)) : `<span class="muted">no location</span>`}</span><b class="mono">${x.barcode}</b><br><span class="muted small">${x.nb} bags · ${x.pcs} pcs${x.closed_at ? " · full" : ""}</span></span></a>`).join("") || `<p class="muted">No boxes yet.</p>`}`; };
 
 V.box = async (id, j) => { await palette(); j = j || await api("box/" + id); const b = j.box;
-  main.innerHTML = `<h1 class="mono">Box ${b.barcode}</h1>${j.msg ? `<p class="okmsg">${esc(j.msg)}</p>` : ""}
+  main.innerHTML = `<h1 class="mono">Box ${b.barcode}</h1>${b.shelf ? `<div class="bxloc big">${esc(gridLoc(b.shelf))}</div>` : ""}${b.closed_at ? `<div class="card closedbx"><b>Closed as full</b> <span class="small muted">${esc(ctime(b.closed_at))}</span><button class="btn gold wide" id="reopen">↩ Reopen box</button></div>` : ""}${j.msg ? `<p class="okmsg">${esc(j.msg)}</p>` : ""}
   <div class="card center">${barSVG(b.barcode).replace("<svg", '<svg class="bcbig"')}</div>
   <form class="card" id="sf"><label>Shelf address<input name="shelf" value="${esc(b.shelf || "")}" autocapitalize="characters"></label><button class="btn wide">Save shelf</button></form>
   <h2>In this box <span class="muted small">${j.bags.length}</span></h2>${j.bags.map(x => `<div class="bag card"><img src="${img(x.part, x.color)}" class="thumb" alt=""><div class="grow"><a href="#/bag/${x.code}">${contents(x)}</a><br><span class="mono small muted">${x.code} · ${x.status}</span></div><button class="btn ghost small rm" data-c="${x.code}">✕</button></div>`).join("")}`;
   $("#sf").onsubmit = async e => { e.preventDefault(); V.box(id, await api("box/" + id, { action: "shelf", shelf: e.target.shelf.value })); };
+  $("#reopen") && ($("#reopen").onclick = async () => V.box(id, await api("box/" + id, { action: "reopen" })));
   $$(".rm").forEach(x => x.onclick = async () => V.box(id, await api("box/" + id, { action: "remove", code: x.dataset.c }))); };
 
 V.host = async () => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } await palette();
-  main.innerHTML = `<h1>Host · ${esc(ME.host.site_name)}</h1><p><a class="btn small" href="#/host/settings">Settings &amp; sorters</a> <a class="btn small gold" href="#/host/batch">Batch prep · print box sheets</a> <a class="btn small" href="#/host/molds">Mold-variant exceptions</a> <a class="btn small" href="#/host/train">Training data</a> <a class="btn small" href="#/host/parts">Import parts file</a></p>
+  main.innerHTML = `<h1>Host · ${esc(ME.host.site_name)}</h1><p><a class="btn small" href="#/host/settings">Settings &amp; sorters</a> <a class="btn small gold" href="#/host/batch">Batch prep · box labels</a> <a class="btn small gold" href="#/host/labels">Bag labels</a> <a class="btn small" href="#/host/baglookup">Bag lookup</a> <a class="btn small" href="#/host/molds">Mold-variant exceptions</a> <a class="btn small" href="#/host/train">Training data</a> <a class="btn small" href="#/host/parts">Import parts file</a></p>
   <div class="card"><h3>Download inventory file</h3><p class="muted small">All confirmed lots from every sorting session of this host, one line per part and color (.bsx file, price 0, condition used).</p><a class="btn wide" id="hostdl" href="/alpha/api/host/export" download>⬇ Download inventory file</a></div>
 `; };
 V.hostSettings = async (j, msg) => { j = j || await api("host"); if (j.error) { main.innerHTML = `<p class="err">${esc(j.error)}</p>`; return; } const h = j.host;
@@ -539,15 +579,15 @@ V.hostSettings = async (j, msg) => { j = j || await api("host"); if (j.error) { 
   <div class="row2"><label>$ per lb<input name="rate_lb" type="number" step="0.01" value="${h.rate_lb}"></label><label>$ per hour<input name="rate_hr" type="number" step="0.01" value="${h.rate_hr}"></label></div>
   <label>"Low stock" below<input name="low_threshold" type="number" min="1" value="${h.low_threshold}"></label>
   <h3 class="sechead">Open bag</h3><label>Default pay share for new sorters (0 to 1; 0 = show parts value only). Each sorter’s own share is set under People.<input name="payout_share" type="number" step="0.01" min="0" max="1" value="${h.payout_share ?? 0}"></label>
-  <p class="small muted">Fallback bag limits, used only when the host has no bag sizes:</p><div class="row2"><label>Bag full at (g, 0 = off)<input name="bag_max_g" type="number" step="1" min="0" value="${h.bag_max_g ?? 110}"></label><label>…or at (cm³, 0 = off)<input name="bag_max_cm3" type="number" step="1" min="0" value="${h.bag_max_cm3 ?? 250}"></label></div>
-  <label>Loose parts density (g per cm³ in a bag)<input name="loose_density" type="number" step="0.01" min="0.05" max="2" value="${h.loose_density ?? 0.4}"></label><button class="btn gold wide">Save</button></form>
+  <p class="small muted">Fallback bag limits, used only when the host has no bag sizes:</p><div class="row2"><label>Bag full at (oz, 0 = off)<input name="bag_max_oz" type="number" step="0.1" min="0" inputmode="decimal" value="${num(ozOf(h.bag_max_g ?? 110))}"></label><label>…or at (cu in, 0 = off)<input name="bag_max_cuin" type="number" step="0.1" min="0" inputmode="decimal" value="${num(cuinOf(h.bag_max_cm3 ?? 250))}"></label></div>
+  <label>Loose parts density (oz per cu in, in a bag)<input name="density_oz_cuin" type="number" step="0.001" min="0.03" max="1.2" inputmode="decimal" value="${num((h.loose_density ?? 0.4) * DENS, 3)}"></label><button class="btn gold wide">Save</button></form>
   <h2>Bag sizes</h2><p class="muted small">The open bag is full at whichever limit comes first. Pick a size per box in Batch prep (boxes without one use the first size).</p>
-  <div id="bsz">${(j.bag_sizes || []).map(z => `<form class="card row2 bsz" data-id="${z.id}"><label>Name<input name="name" value="${esc(z.name)}" required></label><label>Max g<input name="max_g" type="number" min="0" step="1" value="${z.max_g}"></label><label>Max cm³<input name="max_cm3" type="number" min="0" step="1" value="${z.max_cm3}"></label><span class="bszb"><button class="btn small gold">Save</button><button type="button" class="btn small ghost bszrm">Remove</button></span></form>`).join("") || `<p class="muted small">No bag sizes yet.</p>`}</div>
-  <form class="card row2" id="bszadd"><label>New size<input name="name" placeholder="e.g. 6x9" required></label><label>Max g<input name="max_g" type="number" min="0" step="1" value="110"></label><label>Max cm³<input name="max_cm3" type="number" min="0" step="1" value="250"></label><span class="bszb"><button class="btn small gold">Add</button></span></form>
+  <div id="bsz">${(j.bag_sizes || []).map(z => `<form class="card row2 bsz" data-id="${z.id}"><label>Name<input name="name" value="${esc(z.name)}" required></label><label>Max oz<input name="max_oz" type="number" min="0" step="0.1" inputmode="decimal" value="${num(ozOf(z.max_g))}"></label><label>Max cu in<input name="max_cuin" type="number" min="0" step="0.1" inputmode="decimal" value="${num(cuinOf(z.max_cm3))}"></label><span class="bszb"><button class="btn small gold">Save</button><button type="button" class="btn small ghost bszrm">Remove</button></span></form>`).join("") || `<p class="muted small">No bag sizes yet.</p>`}</div>
+  <form class="card row2" id="bszadd"><label>New size<input name="name" placeholder="e.g. 6x9" required></label><label>Max oz<input name="max_oz" type="number" min="0" step="0.1" inputmode="decimal" value="3.9"></label><label>Max cu in<input name="max_cuin" type="number" min="0" step="0.1" inputmode="decimal" value="15.3"></label><span class="bszb"><button class="btn small gold">Add</button></span></form>
   <h2>People</h2>${j.users.map(u => `<div class="row card"><b>${esc(u.username)}</b><span class="muted small grow">${esc(u.display)} · ${u.ns} sessions</span>${u.role === "sorter" ? `<form class="pays" data-u="${esc(u.username)}"><input name="pay_share" type="number" step="0.01" min="0" max="1" value="${u.pay_share || 0}" aria-label="pay share of parts value" title="pay share of parts value (0 = show parts value only)"><button class="btn small">Save pay</button></form>` : ""}${pill(u.role, "")}</div>`).join("")}
   <form class="card" id="as"><h3>Add a sorter</h3><label>Username<input name="username" autocapitalize="none" required></label><label>Name<input name="display"></label><label>Password<input name="password" type="password" minlength="8" required></label><button class="btn wide">Add sorter</button></form>
   <h2>Sessions &amp; pay</h2>${j.sessions.map(s => `<a class="row card" href="#/s/${s.id}"><b class="mono">${s.id}</b><span class="small">${esc(s.username)} · ${esc(s.pay)}</span>${pill(s.status)}</a>`).join("")}`;
-  const fo = f => Object.fromEntries(new FormData(f));
+  const fo = f => toMetric(Object.fromEntries(new FormData(f)));   // oz / lb / cu in typed -> g / cm³ stored
   $("#hs").onsubmit = async e => { e.preventDefault(); const r = await api("host/settings", fo(e.target)); await loadMe(); V.hostSettings(null, r.msg || r.error); };
   const bs = async b => { const r = await api("host/bag-sizes", b); V.hostSettings(null, r.ok ? "Bag sizes saved." : r.error); };
   $$("#bsz .bsz").forEach(f => { f.onsubmit = e => { e.preventDefault(); bs({ action: "edit", id: +f.dataset.id, ...fo(f) }); }; f.querySelector(".bszrm").onclick = () => { if (confirm("Remove this bag size?")) bs({ action: "remove", id: +f.dataset.id }); }; });
@@ -557,18 +597,46 @@ V.hostSettings = async (j, msg) => { j = j || await api("host"); if (j.error) { 
 
 // ---- batch prep (admin): make boxes with N bag QRs and print one sheet per box (master QR + bag 1..N QRs with write-in lines). Labels are printed here, not by sorters.
 V.hostBatch = async () => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } const j = await api("host/batch");
-  main.innerHTML = `<h1>Batch prep</h1><p class="muted small">Before the sorter leaves: print one sheet per box. The sorter scans the box’s master QR, then a bag QR to choose where photos and parts go.</p>
-  <form class="card" id="bf"><div class="row2"><label>Boxes<input name="boxes" type="number" min="1" max="20" value="1" inputmode="numeric"></label><label>Bags per box<input name="bags" type="number" min="1" max="30" value="6" inputmode="numeric"></label></div>
-  <div class="row2"><label>Batch weight (g)<input name="weight_g" type="number" min="1" step="1" inputmode="numeric" placeholder="weigh it now"></label><label>Assigned sorter (optional)<select name="sorter"><option value="">anyone</option>${(j.sorters || []).map(u => `<option>${esc(u)}</option>`).join("")}</select></label></div>
-  <div class="row2"><label>Bag size<select name="bag_size">${(j.bag_sizes || []).map(z => `<option value="${z.id}">${esc(z.name)} · ${z.max_g} g / ${z.max_cm3} cm³</option>`).join("") || `<option value="">host default</option>`}</select></label><label>Shelf address (optional)<input name="shelf" autocapitalize="characters" placeholder="e.g. A-01-2"></label></div><button class="btn gold wide">Create boxes + bag QRs</button></form>
-  <h2>Boxes <span class="muted small">${j.boxes.length}</span></h2><div id="bxlist">${j.boxes.map(x => `<div class="row card"><b class="mono">${esc(x.barcode)}</b><span class="small grow">${x.nbags} bag QR${x.nbags === 1 ? "" : "s"}${x.batch_weight_g ? ` · ${x.batch_weight_g} g` : ""}${x.bag_size_id && j.bag_sizes ? ` · ${esc(j.bag_sizes.find(z => z.id === x.bag_size_id)?.name || "")} bags` : ""}${x.sorter ? ` · for ${esc(x.sorter)}` : ""}${x.session_id ? ` · in use: <span class="mono">${esc(x.session_id)}</span>` : " · not used yet"}</span>${x.nbags ? `<a class="btn small gold" href="#/host/sheet/${x.id}">🖨 Sheet</a>` : ""}</div>`).join("") || `<p class="muted">No boxes yet.</p>`}</div>`;
-  $("#bf").onsubmit = async e => { e.preventDefault(); const f = e.target, r = await api("host/batch", { boxes: +f.boxes.value, bags: +f.bags.value, shelf: f.shelf.value, weight_g: f.weight_g.value || null, sorter: f.sorter.value || null, bag_size_id: +f.bag_size.value || null }); if (!r.ok) return toast(r.error || "failed");
+  main.innerHTML = `<h1>Batch prep</h1><ol class="steps small"><li>Weigh the batch and put it in a box.</li><li>Create the box here and print its label (master QR + shelf location).</li><li>Hand over the box with labeled bags; the sorter scans the box, then each bag.</li></ol>
+  <form class="card" id="bf"><div class="row2"><label>Boxes<input name="boxes" type="number" min="1" max="20" value="1" inputmode="numeric"></label><label>Bag size<select name="bag_size">${(j.bag_sizes || []).map(z => `<option value="${z.id}">${esc(z.name)} · ${fmtW(z.max_g)} / ${fmtV(z.max_cm3)}</option>`).join("") || `<option value="">host default</option>`}</select></label></div>
+  <div class="row2"><label>Batch weight (lb)<input name="batch_lb" type="number" min="0.01" step="0.01" inputmode="decimal" placeholder="weigh it now"></label><label>Assigned sorter (optional)<select name="sorter"><option value="">anyone</option>${(j.sorters || []).map(u => `<option>${esc(u)}</option>`).join("")}</select></label></div>
+  <div class="small"><b>Put-away location</b> (where the box will live)</div><div class="row3"><label>Shelf<input name="g_s" autocapitalize="characters" placeholder="A"></label><label>Row<input name="g_r" inputmode="numeric" placeholder="03"></label><label>Col<input name="g_c" inputmode="numeric" placeholder="2"></label></div><button class="btn gold wide">Create boxes + box labels</button></form>
+  <h2>Boxes <span class="muted small">${j.boxes.length}</span></h2><div id="bxlist">${j.boxes.map(x => `<div class="row card"><b class="mono">${esc(x.barcode)}</b><span class="small grow">${x.shelf ? `<b>${esc(gridLoc(x.shelf))}</b> · ` : ""}${x.nbags} bag${x.nbags === 1 ? "" : "s"}${x.closed_at ? " · full" : ""}${x.batch_weight_g ? ` · ${fmtW(x.batch_weight_g)}` : ""}${x.bag_size_id && j.bag_sizes ? ` · ${esc(j.bag_sizes.find(z => z.id === x.bag_size_id)?.name || "")} bags` : ""}${x.sorter ? ` · for ${esc(x.sorter)}` : ""}${x.session_id ? ` · in use: <span class="mono">${esc(x.session_id)}</span>` : " · not used yet"}</span><a class="btn small gold" href="#/host/sheet/${x.id}">🖨 Label</a></div>`).join("") || `<p class="muted">No boxes yet.</p>`}</div>`;
+  $("#bf").onsubmit = async e => { e.preventDefault(); const f = e.target, g = [f.g_s.value, f.g_r.value, f.g_c.value].map(v => v.trim().toUpperCase()); if (g.some(Boolean) && !g.every(Boolean)) return toast("Fill shelf, row and col (or none)");
+    const r = await api("host/batch", { boxes: +f.boxes.value, shelf: g.every(Boolean) ? g.join("-") : "", weight_g: f.batch_lb.value ? toMetric({ batch_lb: f.batch_lb.value }).weight_g : null, sorter: f.sorter.value || null, bag_size_id: +f.bag_size.value || null }); if (!r.ok) return toast(r.error || "failed");
     location.hash = r.boxes.length === 1 ? "#/host/sheet/" + r.boxes[0] : "#/host/batch"; if (r.boxes.length > 1) V.hostBatch(); }; };
 V.hostSheet = async id => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } const j = await api("host/sheet/" + id); if (j.error) { main.innerHTML = `<p class="err">${esc(j.error)}</p>`; return; }
-  main.innerHTML = `<div class="noprint card center"><b>Box sheet · ${j.bags.length} bag QR${j.bags.length === 1 ? "" : "s"}</b><br><button class="btn gold" id="prt">🖨 Print</button> <a class="btn ghost" href="#/host/batch">Back</a></div>
-  <div class="sheet-print"><div class="master"><img class="q" src="${qrURL(j.box.barcode)}" alt=""><div><div class="small">BOX · scan first</div><div class="c mono">${esc(j.box.barcode)}</div>${j.box.shelf ? `<div class="small">Shelf ${esc(j.box.shelf)}</div>` : ""}${j.box.batch_weight_g ? `<div class="small">Batch ${esc(j.box.batch_weight_g)} g</div>` : ""}<div class="wl">Sorter</div><div class="wl">Date</div></div></div>
-  <div class="bagqrs">${j.bags.map(b => `<div class="bq"><img class="q" src="${qrURL(b.code)}" alt=""><div class="t"><b>Bag ${b.n}</b><span class="mono small">${esc(b.code)}</span><div class="wl"></div><div class="wl"></div></div></div>`).join("")}</div></div>`;
+  main.innerHTML = `<div class="noprint card center"><b>Box label</b><br><button class="btn gold" id="prt">🖨 Print</button> <a class="btn ghost" href="#/host/batch">Back</a></div>
+  <div class="sheet-print"><div class="boxlabel"><div class="bl-loc">${j.box.shelf ? esc(gridLoc(j.box.shelf)) : "no location"}</div><div class="master"><img class="q" src="${qrURL(j.box.barcode)}" alt=""><div><div class="small">BOX · scan first</div><div class="c mono">${esc(j.box.barcode)}</div>${j.box.batch_weight_g ? `<div class="small">Batch ${esc(fmtW(j.box.batch_weight_g))}</div>` : ""}<div class="wl">Sorter</div><div class="wl">Date</div></div></div></div></div>`;
   $("#prt").onclick = () => print(); };
+// pre-labeled bag supply: print a range of permanent bag QRs (no box); reprint by range
+V.hostLabels = async (j) => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } const st = await api("host/bag-labels");
+  main.innerHTML = `<div class="noprint"><h1>Bag labels</h1><p class="muted small">Each bag gets one permanent QR. Sorters scan any unused labeled bag; the app numbers it within the box. ${st.free} unused label${st.free === 1 ? "" : "s"} on hand.</p>
+  <form class="card" id="lf"><div class="row2"><label>New labels<input name="count" type="number" min="1" max="200" value="30" inputmode="numeric"></label><button class="btn gold">Make + print</button></div></form>
+  <form class="card" id="rf"><div class="row3"><label>Reprint from #<input name="from" inputmode="numeric"></label><label>to #<input name="to" inputmode="numeric"></label><button class="btn">Show</button></div></form>
+  ${j ? `<div class="card center"><b>${j.labels.length} label${j.labels.length === 1 ? "" : "s"}${j.from ? ` · #${j.from}–${j.to}` : ""}</b> <button class="btn gold small" id="prt">🖨 Print</button></div>` : ""}</div>
+  ${j ? `<div class="sheet-print"><div class="labelgrid">${j.labels.map(c => `<div class="bl"><img class="q" src="${qrURL(c)}" alt=""><span class="mono">${esc(c)}</span><span class="wn">Bag #</span></div>`).join("")}</div></div>` : ""}`;
+  $("#lf").onsubmit = async e => { e.preventDefault(); const r = await api("host/bag-labels", { count: +e.target.count.value }); if (!r.ok) return toast(r.error || "failed"); V.hostLabels(r); };
+  $("#rf").onsubmit = async e => { e.preventDefault(); const r = await api(`host/bag-labels?from=${+e.target.from.value}&to=${+e.target.to.value}`); if (r.error) return toast(r.error); V.hostLabels(r); };
+  $("#prt") && ($("#prt").onclick = () => print()); };
+// admin bag lookup: scan or type any bag QR -> box, bag number, sorter, dates, contents; mark missing / moved
+V.hostBagLookup = async (code, j) => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; } await palette();
+  if (code && !j) j = await api("host/bag/" + encodeURIComponent(code)); const b = j?.bag;
+  const when = t => esc(ctime(t));
+  main.innerHTML = `<h1>Bag lookup</h1><p class="muted small">Scan or type any bag QR to see where it belongs, e.g. a bag found loose or missing from its box.</p>
+  <div class="card"><div class="scanrow"><input id="lkq" aria-label="Bag label code" placeholder="Bag QR, e.g. BG01000012" autocapitalize="characters" autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="go" value="${esc(code || "")}"><button type="button" class="btn small" id="lkcam" hidden>📷 Scan</button></div><video id="lkvid" class="scanvid" hidden playsinline muted></video></div>
+  ${j?.error ? `<p class="err">${esc(j.error)}</p>` : ""}${j?.msg ? `<p class="okmsg">${esc(j.msg)}</p>` : ""}
+  ${b ? `<div class="card lkres"><div class="lk-head"><span class="mono">${esc(b.code)}</span>${pill(b.state, b.state === "missing" ? "bad" : b.state === "moved" ? "warn" : "ok")}</div>
+    <div class="lk-big">${b.box ? `Box <span class="mono">${esc(b.box.barcode)}</span> · Bag ${b.n ?? "?"}` : "Not in a box"}</div>
+    ${b.box?.shelf ? `<div class="lk-loc">${esc(gridLoc(b.box.shelf))}</div>` : ""}
+    <div class="kv small"><span>Sorter</span><b>${esc(b.sorter || "–")}</b><span>Labeled</span><b>${when(b.created)}</b><span>Sealed</span><b>${when(b.sealed_at)}</b>${b.trace ? `<span>${b.trace === "missing" ? "Marked missing" : "Moved"}</span><b>${when(b.trace_at)}${b.trace_note ? ` · ${esc(b.trace_note)}` : ""}</b>` : ""}</div>
+    <h3>Contents <span class="muted small">${b.lots.length} lot${b.lots.length === 1 ? "" : "s"} · ${b.lots.reduce((a, l) => a + l.qty, 0)} pcs</span></h3>
+    ${b.lots.map(l => `<div class="row small lkl">${lotThumb(l)}<span class="grow"><b>${l.qty}×</b> <span class="mono">${esc(l.part)}</span> · ${esc(l.color_name)}<br><span class="muted">${esc((l.name || "").slice(0, 40))}</span></span></div>`).join("") || `<p class="muted small">Empty.</p>`}
+    <form id="trf" class="lk-tr"><input name="note" aria-label="Note" placeholder="Note (where is it now?)"><div class="row3"><button class="btn small" data-a="missing">Mark missing</button><button class="btn small" data-a="moved">Mark moved</button>${b.trace ? `<button class="btn small ghost" data-a="clear">Clear</button>` : ""}</div></form></div>` : ""}`;
+  const go = v => { v = String(v || "").trim(); if (v) { history.replaceState(null, "", "#/host/baglookup/" + encodeURIComponent(v.toUpperCase())); V.hostBagLookup(v); } };
+  $("#lkq").onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); go($("#lkq").value); } };
+  attachScan($("#lkcam"), $("#lkvid"), go);
+  $$("#trf button").forEach(x => x.onclick = async e => { e.preventDefault(); const r = await api("host/bag/" + encodeURIComponent(b.code), { action: x.dataset.a, note: $("#trf").note.value }); if (r.error) return toast(r.error); V.hostBagLookup(b.code, r); }); };
 V.hostMolds = async (msg) => { if (ME?.user.role !== "admin") { main.innerHTML = `<p class="err">Host admins only.</p>`; return; }
   const j = await api("mold-exceptions"), mm = await moldMap();
   main.innerHTML = `<h1>Mold-variant exceptions</h1><p class="muted small">Parts on this list never show the "Double-check: mold variant" notice and are never offered as a variant chip. Shared by all hosts.</p>
@@ -581,14 +649,14 @@ V.hostMolds = async (msg) => { if (ME?.user.role !== "admin") { main.innerHTML =
   $$(".rmx").forEach(b => b.onclick = async () => { if (confirm("Remove " + b.dataset.p + " from the exception list?")) after(await api("host/mold-exceptions", { action: "remove", part: b.dataset.p })); }); };
 
 V.putaway = () => { main.innerHTML = `<h1>Put-away</h1><p class="muted small">1) Scan the bag QR · 2) scan the shelf address (or a box barcode). Typing works too.</p>
-  <div class="card"><label>1 · Bag QR<input id="code" placeholder="PTS-…" autocapitalize="characters" autocomplete="off"></label><label>2 · Shelf address or box<input id="shelf" placeholder="A-01-2 or BX0100001" autocapitalize="characters" autocomplete="off"></label>
-  <div class="row2"><button class="btn gold" id="save">Put away</button><button class="btn" id="camscan" hidden>📷 Scan</button></div></div><div id="bagview"></div><video id="vid" playsinline hidden></video><div id="log"></div>`;
+  <div class="card"><label>1 · Bag QR<input id="code" placeholder="BG…" autocapitalize="characters" autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="next"></label><label>2 · Shelf address or box<input id="shelf" placeholder="A-01-2 or BX0100001" autocapitalize="characters" autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="go"></label>
+  <p class="small muted">Press Enter (Go) after the shelf, or scan both with the camera: it saves on its own.</p><button class="btn wide" id="camscan" hidden>📷 Scan</button></div><div id="bagview"></div><video id="vid" playsinline hidden></video><div id="log"></div>`;
   const c = $("#code"), s = $("#shelf");
-  const show = async () => { const v = c.value.trim(); if (!/^PTS-/i.test(v)) { $("#bagview").innerHTML = ""; return; } await palette(); const j = await api("bag/" + encodeURIComponent(v.toUpperCase()));
+  const show = async () => { const v = c.value.trim(); if (!v) { $("#bagview").innerHTML = ""; return; } await palette(); const j = await api("bag/" + encodeURIComponent(v.toUpperCase()));
     $("#bagview").innerHTML = j.bag ? `<div class="card"><p class="small muted">In this bag:</p>${j.bag.lots.map(l => `<div class="small">${l.qty}× <b class="mono">${esc(l.part)}</b> ${esc(l.color_name)}</div>`).join("") || "empty"}</div>` : `<p class="err small">${esc(j.error || "")}</p>`; };
   c.onchange = show; c.addEventListener("blur", show);
   const save = async () => { if (!c.value || !s.value) return; const j = await api("putaway", { code: c.value, shelf: s.value }); const p = document.createElement("p"); p.className = (j.ok ? "okmsg" : "err") + " small"; p.textContent = j.ok ? "✓ " + j.msg : "✗ " + j.error; $("#log").prepend(p); if (j.ok) c.value = ""; c.focus(); };
-  c.onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); s.focus(); } }; s.onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); save(); } }; $("#save").onclick = save;
+  c.onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); s.focus(); } }; s.onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); save(); } };
   attachScan($("#camscan"), $("#vid"), v => { if (!c.value) { c.value = v; show(); s.focus(); } else { s.value = v; save(); } }); };
 
 const contents = b => (b.lots || []).map(l => `${l.qty}× ${esc(l.part)} ${esc(l.color_name)}`).join(", ") || "empty";
@@ -619,7 +687,7 @@ V.hostParts = async msg => { if (ME?.user.role !== "admin") { main.innerHTML = `
 
 // ---------------- router
 async function loadMe() { const j = await api("me"); ME = j.error ? null : j; header(); return ME; }
-function header() { $("#who").textContent = ME ? `${ME.host.site_name} · ${ME.user.username}` : ""; $("#tabs").hidden = !ME; $("#hosttab").hidden = !(ME && ME.user.role === "admin"); }
+function header() { $("#who").innerHTML = ME ? `<span class="hn">${esc(ME.host.site_name)} · </span>${esc(ME.user.username)}` : ""; $("#tabs").hidden = !ME; $("#hosttab").hidden = !(ME && ME.user.role === "admin"); }
 async function route() {
   const h = location.hash.slice(1) || "/", [path, qs] = h.split("?");
   if (path === "/logout") { await api("logout", {}); ME = null; header(); location.hash = "#/login"; return; }
@@ -640,8 +708,10 @@ async function route() {
   if (path === "/host/parts") return V.hostParts();
   if (path === "/host/batch") return V.hostBatch(qs || "");
   if ((m = path.match(/^\/host\/sheet\/(\d+)$/))) return V.hostSheet(m[1]);
+  if (path === "/host/labels") return V.hostLabels();
+  if ((m = path.match(/^\/host\/baglookup(?:\/([\w-]+))?$/))) return V.hostBagLookup(m[1] ? decodeURIComponent(m[1]) : "");
   if (path === "/putaway") return V.putaway();
-  main.innerHTML = `<p>Not found. <a href="#/">Home</a></p>`;
+  main.innerHTML = `<div class="card"><h2>Page not found</h2><a class="btn gold wide" href="#/">Go home</a></div>`;
 }
 window.addEventListener("hashchange", route); route();
 // phones keep the app open for hours: when it comes back to the foreground, check for a newer build and offer a reload
