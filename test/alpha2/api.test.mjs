@@ -46,7 +46,7 @@ ok((await J(await post(S, "lot/" + c1, { action: "edit", qty: 1 }))).s === 409, 
 // export
 r = await get(S, `session/${sid}/export.csv`); let t = await r.text();
 ok(r.ok && /attachment; filename="S-\d{6}-\w{4}-Tub_3\.csv"/.test(r.headers.get("content-disposition")), "CSV download");
-ok(t.includes("3001,Brick 2 x 4,5,Red,8,") && /"estimated \(low\) weight \(lb, catalog x 0\.85\)",0\.03\d/.test(t) && t.includes("weighed - real (lb),1.000") && t.includes("est. low weight each (oz)") && /started,"\d\d\/\d\d\/\d{4}, \d\d:\d\d CT"/.test(t), "CSV: lot, color name, catalog weight in lb, weighed lb, CT times");
+ok(t.includes("3001,Brick 2 x 4,5,Red,8,") && /"estimated \(low\) weight \(lb, catalog x 0\.85\)",0\.03\d/.test(t) && t.includes("weighed - real (lb),1.000") && t.includes("est. low weight each (oz)") && /\r\n3001,Brick 2 x 4,5,Red,8,[\d.]+,[\d.]+,\d+\.\d{3},\d+\.\d\d,/.test(t) && /started,"\d\d\/\d\d\/\d{4}, \d\d:\d\d CT"/.test(t), "CSV: lot, color name, catalog weight in lb, weighed lb, CT times");
 r = await get(S, `session/${sid}/export.bsx`); t = await r.text(); ok(r.ok && t.includes("<ItemID>3001</ItemID>") && t.includes("<Qty>8</Qty>") && t.includes("<ColorName>Red</ColorName>"), "inventory file");
 ok((await get(R, `session/${sid}/export.csv`)).status === 404, "another sorter can't export it");
 j = await J(await post(S, "session/" + sid, { action: "reopen" })); ok(j.ok && (await J(await post(S, "lot/" + c1, { action: "edit", qty: 7 }))).ok, "reopen allows edits again");
@@ -58,6 +58,9 @@ for (let i = 0; i < 4; i++) await login("ria", "nope" + i); ok((await J(await lo
 ok((await J(await get(R, "me"))).user, "an existing sign-in keeps working during a lock");
 const S2 = ck(await login("sam", "test-sam-pass")); await post(S, "logout", { everywhere: true });
 ok((await J(await get(S2, "me"))).reason === "signed_out", "log out everywhere ends other sign-ins");
+// colored pictures: stored one is served immutable, missing one is a 404 (the app falls back), bad names refused
+{ const B = process.env.BASE; let r = await fetch(B + "/alpha2/img/3001_5.webp"); ok(r.status === 200 && r.headers.get("content-type") === "image/webp" && /immutable/.test(r.headers.get("cache-control")) && (await r.arrayBuffer()).byteLength > 500, "colored picture served, immutable");
+  r = await fetch(B + "/alpha2/img/3001_9999.webp"); ok(r.status === 404, "missing picture is 404"); r = await fetch(B + "/alpha2/img/..%2Fx_1.webp"); ok(r.status === 404, "bad picture name refused"); }
 // clean up what this test made
 const S3 = ck(await login("sam", "test-sam-pass")); for (const x of [sid, s2]) ok((await J(await post(S3, "session/" + x, { action: "delete" }))).ok, "deleted " + x);
 ok((await J(await get(S3, "sessions"))).sessions.length === 0, "nothing left");

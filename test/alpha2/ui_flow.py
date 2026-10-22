@@ -2,7 +2,7 @@
 # MODE=real: crops go to the recognition service (through the local API). Fails on page errors, banned words or any outside parts-site request.
 import json, os, re, time
 from playwright.sync_api import sync_playwright
-BASE, OUT = os.environ["BASE"], os.path.join(os.environ["OUT"], "flow"); os.makedirs(OUT, exist_ok=True)
+MODE = os.environ.get("MODE", "mock"); BASE, OUT = os.environ["BASE"], os.path.join(os.environ["OUT"], "flow"); os.makedirs(OUT, exist_ok=True)
 DT = "/workspace/gbl/pts-alpha/detector-test"; PHOTOS = [f"{DT}/paper-real/p1.jpg", f"{DT}/card/card_topdown_truth.jpg"]
 BANNED = re.compile(r"brickognize|brickstore|bricqer|(?<!\.)bsx|github", re.I)
 res, errs, outside = {}, [], []
@@ -35,6 +35,8 @@ with sync_playwright() as p:
             pg.mouse.click(xy[0], xy[1]); pg.wait_for_timeout(900); check("tap_box_jumps_to_card", pg.locator(f".pcard.sel[data-id='{tid}']").count() == 1)
             shot("06-tap-to-jump")
             first = pg.locator(".pcard").first; first.scroll_into_view_if_needed(); first.locator(".pcmp").scroll_into_view_if_needed(); pg.wait_for_timeout(400); shot("07-compare-our-match-your-photo")
+            res["colored_pictures_on_cards"] = pg.evaluate("[...document.querySelectorAll('.pcard .pimg img')].filter(i => i.complete && i.naturalWidth && i.currentSrc.includes('/alpha2/img/')).length")
+            if MODE == "mock": check("colored_picture_shown", res["colored_pictures_on_cards"] >= 1)
             check("compare_has_both", first.locator(".ptile img").count() == 1 and first.locator(".pcrop img").count() == 1)
             first.locator(".colorbtn").click(); pg.wait_for_selector("#cs[open] .chip"); n_known = pg.locator("#cs_body .chip").count(); pg.check("#cs_all"); pg.wait_for_timeout(300)
             check("show_all_colors_adds", pg.locator("#cs_body .chip").count() > n_known); shot("08-color-sheet-show-all"); pg.click("#cs_x"); pg.wait_for_timeout(300)

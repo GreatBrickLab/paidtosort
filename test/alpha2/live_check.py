@@ -40,6 +40,11 @@ with sync_playwright() as pw:
         res["timing"] = pg.evaluate("window.PTS_LAST"); res["cards"] = pg.locator(".pcard").count(); check("cards made", res["cards"] >= 8)
         pg.wait_for_timeout(3500); pg.evaluate("(() => { const c = document.querySelector('.pcard'), d = document.querySelector('#dock'), t = document.querySelector('.top'); scrollTo(0, c.getBoundingClientRect().top + scrollY - d.offsetHeight - t.offsetHeight - 6); })()"); shot("04-verify-card")
         f = pg.locator(".pcard").first; f.locator(".pcmp").scroll_into_view_if_needed(); shot("05-compare")
+        res["img_first_view"] = pg.evaluate("performance.getEntriesByType('resource').filter(e => e.name.includes('/alpha2/img/')).map(e => [e.name.split('/').pop(), Math.round(e.duration), e.transferSize > 0 ? 'net' : 'cache', e.responseStatus || 0])")
+        res["colored_on_cards"] = pg.evaluate("[...document.querySelectorAll('.pcard .pimg img')].filter(i => i.complete && i.naturalWidth && i.currentSrc.includes('/alpha2/img/')).length")
+        names = [x[0] for x in res["img_first_view"] if x[3] == 200]
+        res["img_second_view"] = pg.evaluate("""async ns => { const out = []; for (const n of ns) { const t = performance.now(); await new Promise(r => { const i = new Image(); i.onload = i.onerror = r; i.src = '/alpha2/img/' + n; }); out.push([n, Math.round(performance.now() - t)]); } return out; }""", names)
+        check("colored picture on a card", res["colored_on_cards"] >= 1)
         pg.click("#confirmall"); pg.wait_for_function("!document.querySelector('.pcard')", timeout=60000); pg.wait_for_timeout(1500); t = shot("06-lot-list", True); check("lot list low estimate", "Estimated (low)" in t)
         pg.fill("#ff input[name=w]", "0.42"); pg.click("#ff button"); pg.wait_for_selector(".stat"); t = shot("07-finished-summary", True)
         check("summary shows estimated (low) and weighed (real)", "estimated (low)" in t.lower() and "weighed (real)" in t.lower() and " CT" in t)

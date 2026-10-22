@@ -11,11 +11,11 @@ const scoreHTML = v => { const p = Math.round((+v || 0) * 100), k = scoreCls(v);
 const cardHTML = c => `<div class="pcard" data-id="${c.id}" data-part="${esc(c.part)}" data-color="${c.color}" data-qty="${c.qty}">
  <button type="button" class="colorbtn"><i style="background:#${crgb(c.color)}"></i><span class="cn">${esc(cname(c.color))}</span><small>change ▾</small></button>
  <div class="quick">${quickIds(c).map(id => chip(id, id === c.color)).join("")}</div>
- <div class="pimg"><img src="${ref(c.part)}" alt="" onerror="this.onerror=null;${c.crop ? `this.src='${c.crop}'` : "this.style.visibility='hidden'"}"><button type="button" class="pno ${scoreCls(c.confidence)}" hidden aria-label="show this part on the photo"></button></div>
+ <div class="pimg"><img ${picAttrs(c.part, c.color, c.crop)} alt=""><button type="button" class="pno ${scoreCls(c.confidence)}" hidden aria-label="show this part on the photo"></button></div>
  <div class="pinfo"><div class="pn mono">${esc(c.part)}</div><div class="nm">${esc(c.name)}</div>
  <div class="qty"><button type="button" class="qbtn minus" aria-label="one less">−</button><b>${c.qty}</b><button type="button" class="qbtn plus" aria-label="one more">+</button></div>${scoreHTML(c.confidence)}</div>
  <div class="altbox">${altHTML(c)}</div>
- <div class="pcmp"><div class="ptile"><img class="mimg" src="${ref(c.part)}" alt="matched part" draggable="false" onerror="this.style.visibility='hidden'"><span>our match</span></div>${c.crop ? `<div class="pcrop"><img src="${c.crop}" alt="photo of this part" draggable="false"><span>your photo</span></div>` : ""}</div>
+ <div class="pcmp"><div class="ptile"><img class="mimg" ${picAttrs(c.part, c.color)} alt="matched part" draggable="false"><span>our match</span></div>${c.crop ? `<div class="pcrop"><img src="${c.crop}" alt="photo of this part" draggable="false"><span>your photo</span></div>` : ""}</div>
  <div class="mold" hidden></div>
  <div class="pact"><button type="button" class="btn gold ok">✓ Add to lots</button><button type="button" class="btn ghost drop">Drop</button></div><div class="grip" aria-label="swipe up here to confirm">⇡ swipe up here to confirm</div></div>`;
 
@@ -48,7 +48,7 @@ function wireCards(cards, onConfirmed) {
   const ca = $("#confirmall"); ca.onclick = async () => { ca.disabled = true; await new Promise(r => setTimeout(r, 400)); await Q; const todo = $$(".pcard:not(.going):not(.dropping)"); bulk = true; for (const el of todo) await confirmCard(el); bulk = false; ca.disabled = false; left(); onConfirmed(); toast(`Added ${todo.length} card${todo.length === 1 ? "" : "s"} to the lot list`); };
   const setCard = (el, j) => { el.dataset.part = j.part; el.dataset.color = j.color; const c = byId[el.dataset.id]; Object.assign(c, { part: j.part, name: j.name, color: j.color });
     el.querySelector(".pn").textContent = j.part; el.querySelector(".nm").textContent = j.name; el.querySelector(".colorbtn i").style.background = "#" + crgb(j.color); el.querySelector(".colorbtn .cn").textContent = cname(j.color);
-    el.querySelectorAll(".mimg, .pimg img").forEach(i => { i.style.visibility = ""; i.src = ref(j.part); }); el.querySelector(".quick").innerHTML = quickIds(c).map(x => chip(x, x === c.color)).join(""); wireQuick(el); };
+    el.querySelectorAll(".mimg, .pimg img").forEach(i => setPic(i, j.part, j.color)); el.querySelector(".quick").innerHTML = quickIds(c).map(x => chip(x, x === c.color)).join(""); wireQuick(el); };
   const edit = async (el, patch, msg) => { const j = await api("lot/" + el.dataset.id, { action: "edit", ...patch }); if (!j.ok) return toast(j.error || "Could not save"); setCard(el, j); if (msg) toast(msg(j)); return j; };
   const setColor = (el, id) => edit(el, { color: id });
   const wireQuick = el => el.querySelectorAll(".quick .chip").forEach(b => b.onclick = () => setColor(el, +b.dataset.c));

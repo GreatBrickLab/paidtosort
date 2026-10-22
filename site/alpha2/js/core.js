@@ -2,7 +2,13 @@
 const $ = s => document.querySelector(s), $$ = s => [...document.querySelectorAll(s)];
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const BASE = "/alpha2";
-const ref = p => `${BASE}/api/ref/${encodeURIComponent(p)}`;   // reference picture of a part (through our API)
+const ref = p => `${BASE}/api/ref/${encodeURIComponent(p)}`;   // gray reference render of a part (through our API)
+// colored picture first (our own store), then the gray render, then the sorter's crop (if given), else hidden
+const cpic = (p, c) => `${BASE}/img/${String(p).replace(/[^A-Za-z0-9.-]/g, "_")}_${+c || 0}.webp`;
+function picFail(i) { const st = +(i.dataset.st || 0); i.dataset.st = st + 1;
+  if (st === 0) i.src = ref(i.dataset.p); else if (st === 1 && i.dataset.crop) i.src = i.dataset.crop; else { i.onerror = null; i.style.visibility = "hidden"; } }
+const picAttrs = (p, c, crop) => `src="${cpic(p, c)}" data-p="${esc(p)}"${crop ? ` data-crop="${crop}"` : ""} onerror="picFail(this)"`;
+const setPic = (i, p, c) => { i.dataset.st = 0; i.dataset.p = p; i.style.visibility = ""; i.onerror = () => picFail(i); i.src = cpic(p, c); };
 let ME = null, PAL = null, PALBY = {}, Q = Promise.resolve();
 const NET = (() => { let bar = null; const show = on => { if (on && !bar) { bar = document.createElement("div"); bar.id = "netbar"; bar.setAttribute("role", "alert"); bar.textContent = "Offline: photos can’t be identified and changes can’t be saved until you are back online."; document.body.appendChild(bar); } else if (!on && bar) { bar.remove(); bar = null; } };
   addEventListener("offline", () => show(true)); addEventListener("online", () => show(false)); if (navigator.onLine === false) setTimeout(() => show(true)); return { down: () => show(true), up: () => navigator.onLine !== false && show(false) }; })();

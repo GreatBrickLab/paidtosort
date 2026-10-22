@@ -23,7 +23,7 @@ V.home = async () => { const j = await api("sessions"); if (j.error) return;
   attachScan($("#nscan"), $("#nvid"), v => { $("#nf").sname.value = String(v).slice(0, 60); toast("Label scanned"); });
   $("#nf").onsubmit = async e => { e.preventDefault(); const r = await api("sessions", { name: e.target.sname.value }); if (r.ok) location.hash = "#/s/" + r.id; else toast(r.error || "failed"); }; };
 
-const lotRow = l => `<div class="lot row" data-id="${l.id}" data-part="${esc(l.part)}" data-color="${l.color}">${l.crop ? `<img src="${l.crop}" class="thumb" alt="">` : `<img src="${ref(l.part)}" class="thumb" alt="" onerror="this.style.visibility='hidden'">`}
+const lotRow = l => `<div class="lot row" data-id="${l.id}" data-part="${esc(l.part)}" data-color="${l.color}"><img ${picAttrs(l.part, l.color, l.crop)} class="thumb" alt="">
   <span class="grow"><span class="mono"><b>${esc(l.part)}</b></span> <span class="small">${esc(l.name)}</span><br><span class="cdot" style="background:#${crgb(l.color)}"></span><span class="small">${esc(cname(l.color))}</span> <span class="small muted lw" data-part="${esc(l.part)}" data-qty="${l.qty}"></span></span>
   <b class="lq">×${l.qty}</b></div>`;
 const lotEdit = l => `<div class="lotedit card" data-id="${l.id}"><div class="row"><b class="mono">${esc(l.part)}</b><span class="small grow">${esc(l.name)}</span></div>

@@ -9,11 +9,13 @@ T=$(mktemp -d /tmp/pts2.XXXX); PORT=$(python3 -c "import socket;s=socket.socket(
 PID=; cleanup() { rc=$?; [ $rc != 0 ] && [ -f "$T/dev.log" ] && tail -20 "$T/dev.log"; [ -n "$PID" ] && kill -- -"$PID" 2>/dev/null; wait 2>/dev/null || true; rm -rf "$T"; rm -f /tmp/pts-alpha2-test.lock; }
 trap cleanup EXIT
 export CLOUDFLARE_API_TOKEN= CLOUDFLARE_ACCOUNT_ID= WRANGLER_SEND_METRICS=false
-printf 'name = "pts2-local"\ncompatibility_date = "2024-09-01"\n[[d1_databases]]\nbinding = "ALPHA2_DB"\ndatabase_name = "pts2-local"\ndatabase_id = "pts2-local"\n' > "$T/wrangler.toml"
+printf 'name = "pts2-local"\ncompatibility_date = "2024-09-01"\n[[d1_databases]]\nbinding = "ALPHA2_DB"\ndatabase_name = "pts2-local"\ndatabase_id = "pts2-local"\n[[kv_namespaces]]\nbinding = "ALPHA2_IMG"\nid = "pts2-img"\n' > "$T/wrangler.toml"
 { for f in migrations/*.sql; do cat "$f"; done; node scripts/adduser.mjs sam test-sam-pass Sam; node scripts/adduser.mjs ria test-ria-pass Ria; } > "$T/init.sql"
 $WR d1 execute ALPHA2_DB --local --persist-to "$T/state" -c "$T/wrangler.toml" --file "$T/init.sql" >/dev/null
+# colored pictures: everything extracted so far, plus 3001_5 (the mock's Red 2x4) so mock runs exercise the colored path
+PICS=${PICS:-/workspace/brickstore-feed/pictures}; for f in "$PICS"/*.webp "$PICS/3001_59.webp:3001_5.webp"; do src=${f%%:*}; key=$(basename "${f#*:}"); [ -f "$src" ] && $WR kv key put "img/$key" --path "$src" --binding ALPHA2_IMG --local --persist-to "$T/state" -c "$T/wrangler.toml" >/dev/null 2>&1; done
 SECRET=$(python3 -c "import secrets;print(secrets.token_hex(24))"); B=(--binding "ALPHA2_SECRET=$SECRET"); [ "$MODE" = mock ] && B+=(--binding IDENTIFY_MOCK=1)
-setsid bash -c "cd '$ROOT' && exec $WR pages dev site --port $PORT --ip 127.0.0.1 --persist-to '$T/state' --d1 ALPHA2_DB=pts2-local --compatibility-date 2024-09-01 ${B[*]}" >"$T/dev.log" 2>&1 & PID=$!
+setsid bash -c "cd '$ROOT' && exec $WR pages dev site --port $PORT --ip 127.0.0.1 --persist-to '$T/state' --d1 ALPHA2_DB=pts2-local --kv ALPHA2_IMG=pts2-img --compatibility-date 2024-09-01 ${B[*]}" >"$T/dev.log" 2>&1 & PID=$!
 for i in $(seq 60); do curl -sf "http://127.0.0.1:$PORT/alpha2/" >/dev/null 2>&1 && break; sleep 1; done
 export BASE="http://127.0.0.1:$PORT" MODE OUT="$ROOT/test/out"
 case "$SCRIPT" in *.mjs) node "$SCRIPT";; *) python3 "$SCRIPT";; esac

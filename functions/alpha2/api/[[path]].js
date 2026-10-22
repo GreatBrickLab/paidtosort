@@ -1,5 +1,6 @@
 // Paid to Sort alpha 2 API. D1 binding DB (users, sessions, lots), secret SECRET. Every query is scoped to the signed-in user.
 import { checkPw, readCookie, setCookie, CLEAR } from "../../../lib/alpha2/auth.js";
+import PRICES from "../../../lib/alpha2/prices.js";
 import { inventoryXml, lotsFromCards, validPart } from "../../../lib/alpha2/invfile.js";
 const HDR = { "content-type": "application/json", "x-robots-tag": "noindex, nofollow", "cache-control": "no-store" };
 const J = (o, s = 200, h = {}) => new Response(JSON.stringify(o), { status: s, headers: { ...HDR, ...h } }), E = (m, s = 400, x = {}) => J({ error: m, ...x }, s);
@@ -121,10 +122,12 @@ export async function onRequest({ request: req, env, params }) {
     const fn = `${s.id}${s.name ? "-" + s.name.replace(/[^\w-]+/g, "_").slice(0, 30) : ""}`;
     if (m[2] === "bsx") return new Response(inventoryXml(lotsFromCards(ls), { colorName: id => cn[id] || "" }), { headers: { "content-type": "application/xml; charset=utf-8", "content-disposition": `attachment; filename="${fn}.bsx"`, "x-robots-tag": "noindex" } });
     const W = await weights(env, req.url), G_OZ = 28.349523125; let tot = 0, known = 0;
-    const rows = [["part", "name", "color id", "color", "qty", "est. low weight each (oz)", "est. low weight (oz)"]];
-    for (const l of ls) { const g = W[l.part]; if (g) { tot += g * l.qty; known++; } rows.push([l.part, l.name, l.color, cn[l.color] || "", l.qty, g ? (g / G_OZ).toFixed(3) : "", g ? (g * l.qty / G_OZ).toFixed(2) : ""]); }
+    let val = 0;
+    const rows = [["part", "name", "color id", "color", "qty", "est. low weight each (oz)", "est. low weight (oz)", "used avg each ($)", "used avg total ($)", "few sales"]];
+    for (const l of ls) { const g = W[l.part], pr = PRICES[`${l.part}|${l.color}`]; if (g) { tot += g * l.qty; known++; } if (pr) val += pr[0] * l.qty;
+      rows.push([l.part, l.name, l.color, cn[l.color] || "", l.qty, g ? (g / G_OZ).toFixed(3) : "", g ? (g * l.qty / G_OZ).toFixed(2) : "", pr ? pr[0].toFixed(3) : "", pr ? (pr[0] * l.qty).toFixed(2) : "", pr && pr[1] ? "yes" : ""]); }
     rows.push([], ["session", s.id], ["name", s.name || ""], ["started", ctime(s.started)], ["finished", ctime(s.ended)], ["lots", ls.length], ["pieces", ls.reduce((a, l) => a + l.qty, 0)],
-      ["estimated (low) weight (lb, catalog x 0.85)", (tot / G_OZ / 16).toFixed(3)], ["lots without a catalog weight", ls.length - known], ["weighed - real (lb)", s.weighed_g ? (s.weighed_g / G_OZ / 16).toFixed(3) : ""]);
+      ["estimated (low) weight (lb, catalog x 0.85)", (tot / G_OZ / 16).toFixed(3)], ["lots without a catalog weight", ls.length - known], ["used avg total ($)", val.toFixed(2)], ["weighed - real (lb)", s.weighed_g ? (s.weighed_g / G_OZ / 16).toFixed(3) : ""]);
     return new Response("\ufeff" + rows.map(r => r.map(csvCell).join(",")).join("\r\n") + "\r\n", { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename="${fn}.csv"`, "x-robots-tag": "noindex" } });
   }
   return E("not found", 404);
